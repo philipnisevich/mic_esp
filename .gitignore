@@ -1,0 +1,15 @@
+# Secrets - never commit
+MicScribe/config.h
+
+# Arduino / arduino-cli build output
+build/
+*.bin
+*.elf
+*.map
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+.DS_Store
