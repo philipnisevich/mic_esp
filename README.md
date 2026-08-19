@@ -92,10 +92,41 @@ Two kinds of line come out of the board, so a bridge never has to guess:
 ## Bridge
 
 ```bash
-pip install pyserial
-./bridge/bridge.py --copy      # copy each transcript to the clipboard
-./bridge/bridge.py --type      # type it into whatever app has focus (macOS)
-./bridge/bridge.py -v          # also show the device's log lines
+python3 -m venv .venv && ./.venv/bin/pip install pyserial
+```
+
+A venv is needed because Homebrew's Python is marked `EXTERNALLY-MANAGED` and
+refuses a bare `pip install`.
+
+`bridge/bridge.sh` defines a `bridge` command. Source it from your shell rc:
+
+```bash
+echo '[ -f "$HOME/mic_esp/bridge/bridge.sh" ] && . "$HOME/mic_esp/bridge/bridge.sh"' >> ~/.bashrc
+```
+
+```bash
+bridge run              # start it; auto-detects the port
+bridge run --type       # type transcripts into the focused app (macOS)
+bridge run --copy       # copy them to the clipboard
+bridge run -v           # also show the device log lines
+bridge --type           # flags with no subcommand imply `run`
+bridge stop             # release the serial port
+bridge status           # show what currently holds the port
+bridge --help           # full flag list
+```
+
+It finds the checkout by walking up from `$PWD`, so it works from the repo
+root, from `bridge/`, or from anywhere if the checkout is at `~/mic_esp`.
+
+The board accepts only one connection at a time, so `bridge run` stops any
+existing instance first rather than failing with a busy error. If something
+else has the port (`arduino-cli monitor`, the Arduino IDE), `bridge status`
+will name it.
+
+Or call the script directly:
+
+```bash
+./.venv/bin/python bridge/bridge.py --type --verbose
 ```
 
 `--type` drives System Events via `osascript`, so your terminal needs
@@ -147,5 +178,6 @@ MicScribe/
   config.h             your credentials (gitignored)
 bridge/
   bridge.py            optional host-side listener: print / clipboard / type
+  bridge.sh            `bridge run|stop|status` shell command
 flash.sh               compile + upload helper
 ```
