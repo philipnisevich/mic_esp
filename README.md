@@ -49,9 +49,22 @@ Pins live at the top of `MicScribe/MicScribe.ino` if you want to move them.
    ./flash.sh /dev/cu.usbmodem101      # or name it
    ```
 
-   The script uses `esp32:esp32:esp32s3` with PSRAM enabled. If you're using
-   the Arduino IDE instead, pick *ESP32S3 Dev Module* and set **PSRAM** to
-   *QSPI PSRAM* (or *OPI PSRAM* for WROOM-2 / N16R8 modules).
+   In the Arduino IDE, pick *ESP32S3 Dev Module* and match these — all four
+   matter, and two of them fail silently if wrong:
+
+   | Setting | Value | Why |
+   |---|---|---|
+   | USB CDC On Boot | **Enabled** | otherwise `Serial` goes to UART0 on GPIO 43/44 and nothing reaches the host over USB |
+   | PSRAM | **OPI PSRAM** | the N16R8 module has *octal* PSRAM; QSPI mode yields 0 MB with no error |
+   | Flash Size | **16MB** | |
+   | Partition Scheme | 16M Flash (3MB APP/9.9MB FATFS) | |
+
+   Getting PSRAM wrong is not just a smaller buffer: the audio buffer falls
+   back to internal RAM, which starves mbedtls and every upload dies with
+   `SSL - Memory allocation failed` long before it reaches ElevenLabs.
+
+   Check your module with `esptool --chip esp32s3 flash_id`, which reports the
+   PSRAM size and mode.
 
 3. **Talk**
 
@@ -100,6 +113,10 @@ Constants at the top of the sketch:
 | `MAX_SECONDS_NO_PSRAM` | 6 | fallback cap when the buffer has to live in SRAM |
 | `MIN_RECORD_MS` | 300 | anything shorter is treated as an accidental tap |
 | `MIC_SLOT` | `I2S_STD_SLOT_LEFT` | match this to how you wired the mic's L/R pin |
+
+If a take reports `peak 32768` the input is clipping at full scale — drop
+`MIC_GAIN` until peaks land around 20000-28000. Scribe tolerates some clipping,
+but sustained clipping costs accuracy on quiet or fast speech.
 
 The INMP441 is quiet at conversational distance, so the signal path is:
 24-bit sample → one-pole high-pass at ~13 Hz (kills the mic's DC offset) →

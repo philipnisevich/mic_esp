@@ -46,7 +46,11 @@ static const size_t I2S_CHUNK_FRAMES = 256;  // 16 ms per read at 16 kHz
 
 // Recording length depends on where the buffer can live.
 static const uint32_t MAX_SECONDS_PSRAM    = 20;
-static const uint32_t MAX_SECONDS_NO_PSRAM = 6;
+// Without PSRAM the buffer competes with the TLS stack for internal RAM, and
+// mbedtls needs ~40-50 KB free to complete a handshake. 3 s costs 96 KB, which
+// still leaves it room; 6 s did not, and the upload failed with
+// "SSL - Memory allocation failed".
+static const uint32_t MAX_SECONDS_NO_PSRAM = 3;
 
 // ---------------------------------------------------------------- state ----
 static I2SClass I2S;
@@ -274,6 +278,47 @@ static void normalise() {
   logf("normalised x%.1f (peak was %d)", scale, (int)gPeak);
 }
 
+// ---------------------------------------------------------- diagnostics ----
+// Called when the upload fails at the transport layer, which lumps together
+// DNS failure, a blocked port, and a broken TLS handshake. Walk the stack one
+// layer at a time so the log says which one it actually was.
+static void logNetworkDiagnostics() {
+  logf("wifi: status=%d ssid=%s ip=%s gw=%s dns=%s rssi=%d",
+       (int)WiFi.status(), WiFi.SSID().c_str(),
+       WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+       WiFi.dnsIP().toString().c_str(), WiFi.RSSI());
+  logf("heap: free=%u largest=%u psram_free=%u",
+       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+       (unsigned)ESP.getFreePsram());
+
+  IPAddress addr;
+  if (!WiFi.hostByName("api.elevenlabs.io", addr)) {
+    logf("dns: FAILED to resolve api.elevenlabs.io");
+    return;
+  }
+  logf("dns: api.elevenlabs.io -> %s", addr.toString().c_str());
+
+  NetworkClient plain;
+  if (!plain.connect(addr, 443, 8000)) {
+    logf("tcp: FAILED to open port 443 - blocked, or a captive portal");
+    return;
+  }
+  logf("tcp: port 443 reachable");
+  plain.stop();
+
+  NetworkClientSecure tls;
+  tls.setInsecure();
+  tls.setHandshakeTimeout(15);
+  if (tls.connect("api.elevenlabs.io", 443)) {
+    logf("tls: handshake OK - the transport is fine, retry may succeed");
+    tls.stop();
+  } else {
+    char err[128] = {0};
+    int code = tls.lastError(err, sizeof(err));
+    logf("tls: handshake FAILED (%d) %s", code, err);
+  }
+}
+
 // ----------------------------------------------------------- elevenlabs ----
 static bool transcribe(size_t pcmBytes) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -338,8 +383,9 @@ static bool transcribe(size_t pcmBytes) {
   if (code <= 0) {
     String err = HTTPClient::errorToString(code);
     logf("transport error: %s", err.c_str());
-    emitEvent("error", "error", err.c_str());
     http.end();
+    logNetworkDiagnostics();
+    emitEvent("error", "error", err.c_str());
     return false;
   }
 
@@ -423,7 +469,14 @@ static bool allocateBuffer() {
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  // Over native USB CDC the host has to enumerate and open the port before
+  // anything we print is actually delivered, so give it a moment. Falls
+  // through after the timeout when nobody is listening.
+  uint32_t serialWait = millis();
+  while (!Serial && millis() - serialWait < 2000) {
+    delay(10);
+  }
+  delay(200);
   Serial.println();
   logf("MicScribe booting");
 

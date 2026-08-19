@@ -59,7 +59,11 @@ def type_text(text):
     if sys.platform != "darwin":
         print("[bridge] --type is macOS-only", file=sys.stderr)
         return
+    # A literal newline inside an AppleScript string literal is a syntax error,
+    # so splice line breaks in as `return` instead of embedding them.
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+    escaped = escaped.replace("\n", '" & return & "')
     script = f'tell application "System Events" to keystroke "{escaped}"'
     try:
         subprocess.run(["osascript", "-e", script], check=True)
@@ -69,6 +73,23 @@ def type_text(text):
             "permission in System Settings > Privacy & Security",
             file=sys.stderr,
         )
+
+
+def reset_board(ser):
+    """Reboot the ESP32 the same way the Arduino IDE monitor does.
+
+    EN is driven by RTS and GPIO0 by DTR, so holding EN low briefly with GPIO0
+    high restarts the board into normal run mode.
+    """
+    try:
+        ser.setDTR(False)   # GPIO0 high -> run, not download mode
+        ser.setRTS(True)    # EN low  -> held in reset
+        time.sleep(0.1)
+        ser.setRTS(False)   # EN high -> boot
+        time.sleep(0.05)
+        ser.reset_input_buffer()
+    except (OSError, serial.SerialException) as exc:
+        print(f"[bridge] reset failed: {exc}", file=sys.stderr)
 
 
 def handle_line(line, args):
@@ -111,7 +132,15 @@ def main():
     ap.add_argument("--copy", action="store_true", help="copy transcripts to the clipboard")
     ap.add_argument("--type", action="store_true", help="type transcripts into the focused app")
     ap.add_argument("--verbose", "-v", action="store_true", help="show device log lines")
+    ap.add_argument(
+        "--reset", action="store_true",
+        help="pulse DTR/RTS on connect to reboot the board (shows its boot log)"
+    )
     args = ap.parse_args()
+
+    # Without this, Python block-buffers stdout whenever it is not a terminal,
+    # so transcripts vanish into a pipe or a log file until the buffer fills.
+    sys.stdout.reconfigure(line_buffering=True)
 
     port = args.port or find_port()
     if not port:
@@ -122,6 +151,8 @@ def main():
     while True:
         try:
             with serial.Serial(port, args.baud, timeout=1) as ser:
+                if args.reset:
+                    reset_board(ser)
                 while True:
                     raw = ser.readline()
                     if raw:
