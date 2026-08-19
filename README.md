@@ -98,11 +98,18 @@ python3 -m venv .venv && ./.venv/bin/pip install pyserial
 A venv is needed because Homebrew's Python is marked `EXTERNALLY-MANAGED` and
 refuses a bare `pip install`.
 
-`bridge/bridge.sh` defines a `bridge` command. Source it from your shell rc:
+`bridge/bridge.sh` defines a `bridge` command. Source it from your shell rc —
+it is POSIX enough to work in both bash and zsh, so add it to whichever you
+actually use (or both):
 
 ```bash
-echo '[ -f "$HOME/mic_esp/bridge/bridge.sh" ] && . "$HOME/mic_esp/bridge/bridge.sh"' >> ~/.bashrc
+LINE='[ -f "$HOME/mic_esp/bridge/bridge.sh" ] && . "$HOME/mic_esp/bridge/bridge.sh"'
+echo "$LINE" >> ~/.zshrc     # zsh is the macOS default
+echo "$LINE" >> ~/.bashrc
 ```
+
+Check what you are running with `echo $0` — the login shell recorded in
+`dscl` is not always the one your terminal actually opens.
 
 ```bash
 bridge run              # start it; auto-detects the port
