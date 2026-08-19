@@ -82,10 +82,22 @@ def reset_board(ser):
     high restarts the board into normal run mode.
     """
     try:
-        ser.setDTR(False)   # GPIO0 high -> run, not download mode
-        ser.setRTS(True)    # EN low  -> held in reset
+        # The ESP32-S3's built-in USB Serial/JTAG has no physical DTR/RTS lines;
+        # it decodes a specific sequence of the two into a reset instead. This
+        # is the order esptool uses, and the classic EN/GPIO0 wiggle does
+        # nothing on these parts.
+        ser.setRTS(False)
+        ser.setDTR(False)
         time.sleep(0.1)
-        ser.setRTS(False)   # EN high -> boot
+        ser.setDTR(True)
+        ser.setRTS(False)
+        time.sleep(0.1)
+        ser.setRTS(True)
+        ser.setDTR(False)
+        ser.setRTS(True)
+        time.sleep(0.1)
+        ser.setDTR(False)
+        ser.setRTS(False)
         time.sleep(0.05)
         ser.reset_input_buffer()
     except (OSError, serial.SerialException) as exc:

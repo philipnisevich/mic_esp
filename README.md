@@ -75,6 +75,53 @@ Pins live at the top of `MicScribe/MicScribe.ino` if you want to move them.
    Hold the button, say something, release. The transcript appears within a
    second or two.
 
+## Wake word
+
+Say **"Hey Nova"** (or "Hi Nova" / "Okay Nova") and the board starts a take,
+ending it when you stop talking. The button still works as push-to-talk.
+
+Detection is MultiNet (`mn5q8_en`) running continuously in command mode, not
+WakeNet. WakeNet wake words are trained models and the only one bundled with
+the Arduino core is "Hi, ESP"; custom words are a paid Espressif service.
+MultiNet takes phrases as runtime phoneme strings, so a custom word costs
+nothing but a table entry. The trade-off is more false accepts than a
+purpose-trained wake model.
+
+Phonemes come from the core's own G2P tool, not guesswork:
+
+```bash
+pip install g2p_en
+python3 ~/Library/Arduino15/packages/esp32/hardware/esp32/*/libraries/ESP_SR/tools/gen_sr_commands.py "Hey Nova,Hi Nova,Okay Nova"
+```
+
+To change the word, regenerate and replace `SR_COMMANDS` in the sketch. Avoid
+single short syllables — they false-accept constantly, which is why bare
+"Nova" is left out.
+
+### The channel-count trap
+
+`input_format` must describe **three** channels, e.g. `"MNN"` for one mic.
+`esp32-hal-sr.c` hardcodes `SR_CHANNEL_NUM = 3` and always expands the fill
+callback's output into 3 interleaved channels before calling the AFE's
+`feed()`. Passing `"M"` makes the AFE read that 3-channel stream as mono, and
+**nothing is ever detected** — no error, no warning, just silence. The core's
+own example has the same mismatch (`"MM"` with 3 channels fed).
+
+### How the audio path works
+
+ESP-SR owns the I2S reads: it pulls samples through `srFill()` rather than
+reading the bus itself. That gives one reader teeing the same audio into both
+the detector and the capture buffer, and makes the fill callback the only
+writer of the buffers — which is what keeps the state machine race-free across
+SR's feed task, its detect task, and `loop()`.
+
+| Constant | Default | What it does |
+|---|---|---|
+| `PREROLL_MS` | 300 | replayed at the start of a take so the first word is not clipped; if the tail of "Nova" lands in transcripts, lower it |
+| `VAD_SILENCE_MS` | 800 | quiet this long ends a take |
+| `VAD_MIN_SPEECH_MS` | 400 | ...but never before this much audio |
+| `VAD_NOISE_MULT` | 3.0 | speech = this much above the tracked noise floor |
+
 ## Serial protocol
 
 Two kinds of line come out of the board, so a bridge never has to guess:

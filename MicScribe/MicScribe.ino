@@ -1,11 +1,21 @@
-// MicScribe - push-to-talk speech to text, entirely on an ESP32-S3.
+// MicScribe - hands-free speech to text, entirely on an ESP32-S3.
 //
-// Hold the button -> INMP441 audio is captured over I2S into PSRAM.
-// Release the button -> a WAV is streamed straight to the ElevenLabs
-// Scribe API from the ESP32 and the transcript comes back out of the
-// serial port. No host-side helper is involved in the transcription.
+// Two ways to start a take:
+//   say "Hey Nova"   -> ESP-SR MultiNet spots the phrase on-chip, then audio
+//                       is captured until you stop talking (energy VAD)
+//   hold the button  -> classic push-to-talk, captured until you let go
 //
-// Board: "ESP32S3 Dev Module", PSRAM enabled.
+// Either way the audio lands in PSRAM as a WAV and is streamed straight to the
+// ElevenLabs Scribe API from the board itself. The transcript comes back out
+// of the serial port. No host-side helper is involved.
+//
+// Wake detection uses MultiNet (mn5q8_en) in continuous command mode rather
+// than WakeNet, because WakeNet wake words are trained models and the only one
+// bundled with the core is "Hi, ESP". MultiNet takes phrases as runtime
+// phoneme strings, so "Hey Nova" costs nothing but a table entry. The
+// trade-off is more false accepts than a purpose-trained wake model.
+//
+// Board: "ESP32S3 Dev Module", PSRAM=OPI, Partition Scheme "ESP SR 16M".
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -13,6 +23,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <ESP_I2S.h>
+#include <ESP_SR.h>
 
 #include "config.h"
 
@@ -37,9 +48,21 @@ static const i2s_std_slot_mask_t MIC_SLOT = I2S_STD_SLOT_LEFT;
 
 // ---------------------------------------------------------------- audio ----
 static const uint32_t SAMPLE_RATE = 16000;   // plenty for speech, small payloads
-static const float    MIC_GAIN    = 10.0f;   // fixed pre-gain, see normalise()
+// 10.0 clipped at full scale on normal speech, which costs wake-word accuracy
+// far more than it costs Scribe. 4.0 leaves headroom for normalise() to use.
+static const float    MIC_GAIN    = 4.0f;
 static const float    HPF_ALPHA   = 0.995f;  // ~13 Hz high-pass, kills DC offset
 static const uint32_t MIN_RECORD_MS = 300;   // ignore accidental taps
+
+// Wake-word capture. Detection fires slightly after the phrase ends, so a
+// short pre-roll keeps the first word of what follows from being clipped. Too
+// much pre-roll and the tail of "Nova" lands in the transcript - if you see
+// that, lower this first.
+static const uint32_t PREROLL_MS      = 300;
+static const uint32_t VAD_SILENCE_MS  = 800;   // quiet this long ends a take
+static const uint32_t VAD_MIN_SPEECH_MS = 400; // ...but never before this much
+static const float    VAD_NOISE_MULT  = 3.0f;  // speech = this x the noise floor
+static const uint32_t VAD_MIN_LEVEL   = 250;   // absolute floor for a dead-quiet room
 
 static const size_t WAV_HEADER_SIZE = 44;
 static const size_t I2S_CHUNK_FRAMES = 256;  // 16 ms per read at 16 kHz
@@ -60,10 +83,36 @@ static size_t   gCapacity   = 0;        // total bytes allocated
 static size_t   gMaxSamples = 0;
 static size_t   gSamples    = 0;        // samples captured this take
 
-static bool     gRecording      = false;
-static uint32_t gRecordStartMs  = 0;
 static int32_t  gPeak           = 0;
 static float    gHpfX1 = 0.0f, gHpfY1 = 0.0f;
+
+// Capture state machine. The SR fill callback is the only writer of the audio
+// buffers, so every transition happens there and loop() just observes.
+static const uint8_t ST_LISTENING = 0;  // idle, filling the pre-roll ring
+static const uint8_t ST_CAPTURING = 1;  // recording a take
+static const uint8_t ST_PENDING   = 2;  // take finished, waiting for loop()
+static const uint8_t ST_UPLOADING = 3;  // loop() is talking to ElevenLabs
+
+static volatile uint8_t gState = ST_LISTENING;
+static volatile bool    gWakeRequested = false;  // set by the SR event task
+static volatile bool    gButtonHeld    = false;  // set by loop()
+static bool     gManualCapture = false;          // this take came from the button
+static const char *gEndReason = "";
+
+// Pre-roll ring, so a take does not start mid-syllable.
+static int16_t *gRing    = nullptr;
+static size_t   gRingLen = 0;
+static size_t   gRingPos = 0;
+static bool     gRingWrapped = false;
+
+// Energy VAD.
+static float    gNoiseFloor = 200.0f;
+static uint32_t gSilenceMs  = 0;
+static uint32_t gCapturedMs = 0;
+
+// Scratch for the 32-bit I2S reads that get converted down to 16-bit.
+static int32_t *gScratch      = nullptr;
+static size_t   gScratchCount = 0;
 
 static inline int16_t *pcm() { return (int16_t *)(gBuffer + WAV_HEADER_SIZE); }
 
@@ -212,53 +261,184 @@ static void writeWavHeader(uint8_t *dst, size_t pcmBytes) {
   put32(dst + 40, pcmBytes);
 }
 
+// ------------------------------------------------------------- wake word ---
+// Phonemes generated with the core's own tool, so they match what MultiNet
+// was trained to expect:
+//   python3 libraries/ESP_SR/tools/gen_sr_commands.py "Hey Nova,Hi Nova,Okay Nova"
+// All three map to command 0 - any of them starts a take. Bare "Nova" is
+// deliberately left out: one short syllable false-accepts constantly.
+static const sr_cmd_t SR_COMMANDS[] = {
+  {0, "Hey Nova",  "hd NbVc"},
+  {0, "Hi Nova",   "hi NbVc"},
+  {0, "Okay Nova", "bKd NbVc"},
+};
+
 // ------------------------------------------------------------- recording ---
-static void startRecording() {
-  gSamples = 0;
-  gPeak = 0;
-  gHpfX1 = 0.0f;
-  gHpfY1 = 0.0f;
-  gRecordStartMs = millis();
-  gRecording = true;
-
-  // The DMA ring still holds audio from before the button press, plus the mic
-  // needs a moment to settle. Throw away the first ~100 ms.
-  static int32_t scratch[I2S_CHUNK_FRAMES];
-  for (int i = 0; i < 7; i++) {
-    I2S.readBytes((char *)scratch, sizeof(scratch));
+static void ringWrite(const int16_t *src, size_t n) {
+  if (!gRing || gRingLen == 0) return;
+  if (n >= gRingLen) {           // this chunk alone overruns the ring
+    memcpy(gRing, src + (n - gRingLen), gRingLen * sizeof(int16_t));
+    gRingPos = 0;
+    gRingWrapped = true;
+    return;
   }
-
-  setStatus(STATUS_RECORDING);
-  logf("recording...");
-  emitEvent("state", "state", "recording");
+  size_t tail = gRingLen - gRingPos;
+  if (n <= tail) {
+    memcpy(gRing + gRingPos, src, n * sizeof(int16_t));
+    gRingPos += n;
+  } else {
+    memcpy(gRing + gRingPos, src, tail * sizeof(int16_t));
+    memcpy(gRing, src + tail, (n - tail) * sizeof(int16_t));
+    gRingPos = n - tail;
+    gRingWrapped = true;
+  }
+  if (gRingPos >= gRingLen) {
+    gRingPos = 0;
+    gRingWrapped = true;
+  }
 }
 
-// Pull one chunk out of I2S and append it to the buffer.
-static void captureChunk() {
-  static int32_t raw[I2S_CHUNK_FRAMES];
+static void ringReset() {
+  gRingPos = 0;
+  gRingWrapped = false;
+}
 
-  size_t bytes = I2S.readBytes((char *)raw, sizeof(raw));
-  size_t frames = bytes / sizeof(int32_t);
-  if (frames == 0) return;
-
+// Append raw samples to the take, tracking the peak as we go.
+static void appendSamples(const int16_t *src, size_t n) {
   int16_t *out = pcm();
-  for (size_t i = 0; i < frames && gSamples < gMaxSamples; i++) {
-    // INMP441 gives 24 bits left-justified inside a 32-bit slot.
-    float x = (float)(raw[i] >> 8);
+  for (size_t i = 0; i < n && gSamples < gMaxSamples; i++) {
+    int16_t s = src[i];
+    out[gSamples++] = s;
+    int32_t mag = s < 0 ? -(int32_t)s : (int32_t)s;
+    if (mag > gPeak) gPeak = mag;
+  }
+}
 
-    // One-pole high-pass to strip the mic's DC offset and low rumble.
-    float y = HPF_ALPHA * (gHpfY1 + x - gHpfX1);
+static void startCapture(bool manual) {
+  gSamples = 0;
+  gPeak = 0;
+  gSilenceMs = 0;
+  gCapturedMs = 0;
+  gManualCapture = manual;
+  gEndReason = "";
+
+  // Replay the pre-roll so the take does not begin mid-word.
+  if (gRing && gRingLen) {
+    if (gRingWrapped) {
+      appendSamples(gRing + gRingPos, gRingLen - gRingPos);
+      appendSamples(gRing, gRingPos);
+    } else {
+      appendSamples(gRing, gRingPos);
+    }
+  }
+  ringReset();
+  gState = ST_CAPTURING;
+}
+
+static void endCapture(const char *reason) {
+  gEndReason = reason;
+  gState = ST_PENDING;
+}
+
+// Runs in the SR feed task, once per audio chunk. This is the only place the
+// audio buffers are written, which is what keeps the state machine race-free.
+static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
+  if (n == 0) return;
+  uint32_t chunkMs = (uint32_t)((n * 1000) / SAMPLE_RATE);
+
+  uint8_t st = gState;
+  if (st == ST_PENDING || st == ST_UPLOADING) {
+    return;  // still draining I2S so nothing goes stale, but discard the audio
+  }
+
+  if (st == ST_LISTENING) {
+    // Track the room's noise floor while nothing is happening.
+    gNoiseFloor = gNoiseFloor * 0.98f + (float)level * 0.02f;
+    ringWrite(pcm16, n);
+
+    bool manual = gButtonHeld;
+    if (!gWakeRequested && !manual) return;
+    gWakeRequested = false;
+    startCapture(manual);
+    // fall through so this chunk is captured too
+  }
+
+  appendSamples(pcm16, n);
+  gCapturedMs += chunkMs;
+
+  if (gManualCapture) {
+    if (!gButtonHeld) endCapture("button released");
+  } else {
+    float threshold = gNoiseFloor * VAD_NOISE_MULT;
+    if (threshold < (float)VAD_MIN_LEVEL) threshold = (float)VAD_MIN_LEVEL;
+    if ((float)level < threshold) {
+      gSilenceMs += chunkMs;
+    } else {
+      gSilenceMs = 0;
+    }
+    if (gSilenceMs >= VAD_SILENCE_MS && gCapturedMs >= VAD_MIN_SPEECH_MS) {
+      endCapture("silence");
+    }
+  }
+
+  if (gSamples >= gMaxSamples) endCapture("length limit");
+}
+
+// ESP-SR pulls audio through this instead of reading I2S itself, which lets a
+// single reader tee the same samples into both the detector and our buffers.
+// It hands us a 16-bit mono buffer; the INMP441 gives 24-bit in 32-bit slots,
+// so we read double and convert in place.
+static esp_err_t srFill(void *arg, void *out, size_t len, size_t *bytes_read, uint32_t timeout_ms) {
+  size_t frames = len / sizeof(int16_t);
+
+  if (gScratchCount < frames) {
+    int32_t *grown = (int32_t *)heap_caps_realloc(gScratch, frames * sizeof(int32_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!grown) {
+      *bytes_read = 0;
+      return ESP_ERR_NO_MEM;
+    }
+    gScratch = grown;
+    gScratchCount = frames;
+  }
+
+  size_t got = I2S.readBytes((char *)gScratch, frames * sizeof(int32_t));
+  size_t n = got / sizeof(int32_t);
+
+  int16_t *dst = (int16_t *)out;
+  uint64_t acc = 0;
+  for (size_t i = 0; i < n; i++) {
+    float x = (float)(gScratch[i] >> 8);          // 24-bit, sign preserved
+    float y = HPF_ALPHA * (gHpfY1 + x - gHpfX1);  // strip DC and rumble
     gHpfX1 = x;
     gHpfY1 = y;
 
-    int32_t s = (int32_t)(y * MIC_GAIN / 256.0f);  // 24-bit domain -> 16-bit
+    int32_t s = (int32_t)(y * MIC_GAIN / 256.0f);
     if (s > 32767) s = 32767;
     if (s < -32768) s = -32768;
+    dst[i] = (int16_t)s;
+    acc += (uint32_t)(s < 0 ? -s : s);
+  }
+  for (size_t i = n; i < frames; i++) dst[i] = 0;
 
-    int32_t mag = s < 0 ? -s : s;
-    if (mag > gPeak) gPeak = mag;
+  *bytes_read = frames * sizeof(int16_t);
+  processAudio(dst, n, n ? (uint32_t)(acc / n) : 0);
+  return ESP_OK;
+}
 
-    out[gSamples++] = (int16_t)s;
+// Runs in the SR detect task. It only raises a flag - the fill callback owns
+// the buffers, so it performs the actual transition on the next chunk.
+static void srEvent(void *arg, sr_event_t event, int command_id, int phrase_id) {
+  switch (event) {
+    case SR_EVENT_COMMAND:
+      if (gState == ST_LISTENING) {
+        gWakeRequested = true;
+      }
+      break;
+    case SR_EVENT_TIMEOUT:
+      // Command mode times out on its own; we want it listening forever.
+      sr_set_mode(SR_MODE_COMMAND);
+      break;
+    default: break;
   }
 }
 
@@ -461,9 +641,42 @@ static bool allocateBuffer() {
     return false;
   }
 
-  logf("buffer: %u KB in %s, max %lu s of audio",
+  gRingLen = (size_t)((SAMPLE_RATE * PREROLL_MS) / 1000);
+  gRing = psram > 0 ? (int16_t *)ps_malloc(gRingLen * sizeof(int16_t))
+                    : (int16_t *)malloc(gRingLen * sizeof(int16_t));
+  if (!gRing) {
+    gRingLen = 0;
+    logf("WARNING: no pre-roll buffer, takes may clip their first word");
+  }
+
+  logf("buffer: %u KB in %s, max %lu s of audio, %lu ms pre-roll",
        (unsigned)(gCapacity / 1024), psram > 0 ? "PSRAM" : "internal RAM",
-       (unsigned long)seconds);
+       (unsigned long)seconds, (unsigned long)PREROLL_MS);
+  return true;
+}
+
+// Continuous on-chip phrase spotting. MultiNet is normally the second stage
+// behind a wake word, so we run it in command mode permanently and treat a
+// command hit as the wake.
+static bool startWakeWord() {
+  // input_format must describe THREE channels, not one. esp32-hal-sr.c hardcodes
+  // SR_CHANNEL_NUM = 3 and always expands whatever the fill callback returns
+  // into 3 interleaved channels before calling afe feed(). Passing "M" makes
+  // the AFE read that 3-channel stream as mono, so the detector only ever sees
+  // garbage and nothing is ever recognised. "MNN" = our mic in channel 0, the
+  // two channels the HAL zero-fills marked unused.
+  esp_err_t err = sr_start(
+    srFill, nullptr, SR_CHANNELS_MONO, SR_MODE_COMMAND, "MNN",
+    SR_COMMANDS, sizeof(SR_COMMANDS) / sizeof(SR_COMMANDS[0]), srEvent, nullptr
+  );
+  if (err != ESP_OK) {
+    logf("FATAL: sr_start failed (%d) %s", (int)err, esp_err_to_name(err));
+    return false;
+  }
+  logf("wake word ready: say \"Hey Nova\" (or Hi/Okay Nova)");
+  logf("heap after SR: free=%u largest=%u psram_free=%u",
+       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+       (unsigned)ESP.getFreePsram());
   return true;
 }
 
@@ -504,43 +717,39 @@ void setup() {
 
   connectWiFi();
 
+  // After WiFi, so the network stack claims its internal RAM before ESP-SR
+  // takes what it needs.
+  if (!startWakeWord()) {
+    logf("continuing with the button only");
+  }
+
   setStatus(STATUS_IDLE);
-  logf("ready - hold GPIO%d to talk, release to transcribe", PIN_BUTTON);
+  logf("ready - say \"Hey Nova\", or hold GPIO%d to talk", PIN_BUTTON);
   emitEvent("state", "state", "ready");
 }
 
 void loop() {
-  bool pressed = buttonPressedStable();
+  gButtonHeld = buttonPressedStable();
 
-  if (pressed && !gRecording) {
-    startRecording();
+  if (gState == ST_CAPTURING) {
+    setStatus(STATUS_RECORDING);
   }
 
-  if (gRecording) {
-    captureChunk();
+  if (gState == ST_PENDING) {
+    gState = ST_UPLOADING;
 
-    if (gSamples >= gMaxSamples) {
-      logf("hit the length limit, cutting the take short");
-      pressed = false;
-    }
+    size_t samples = gSamples;
+    size_t pcmBytes = samples * 2;
+    float seconds = samples / (float)SAMPLE_RATE;
 
-    if (!pressed) {
-      gRecording = false;
-      uint32_t durationMs = millis() - gRecordStartMs;
-      size_t pcmBytes = gSamples * 2;
+    logf("captured %.2f s (%s), peak %d", seconds, gEndReason, (int)gPeak);
 
-      if (durationMs < MIN_RECORD_MS || gSamples == 0) {
-        logf("too short (%lu ms), ignoring", (unsigned long)durationMs);
-        setStatus(STATUS_IDLE);
-        emitEvent("state", "state", "ready");
-        return;
-      }
-
-      logf("captured %.2f s, peak %d", gSamples / (float)SAMPLE_RATE, (int)gPeak);
+    if (samples == 0 || (uint32_t)(seconds * 1000) < MIN_RECORD_MS) {
+      logf("too short, ignoring");
+    } else {
       if (gPeak < 200) {
         logf("WARNING: signal is nearly silent - check mic wiring and MIC_SLOT");
       }
-
       normalise();
       writeWavHeader(gBuffer, pcmBytes);
 
@@ -550,13 +759,18 @@ void loop() {
       bool ok = transcribe(pcmBytes);
       setStatus(ok ? STATUS_OK : STATUS_ERROR);
       delay(400);
-      setStatus(STATUS_IDLE);
-      emitEvent("state", "state", "ready");
     }
-    return;
+
+    // Reset the detector's context so the take we just sent cannot re-trigger.
+    gWakeRequested = false;
+    ringReset();
+    gState = ST_LISTENING;
+    setStatus(STATUS_IDLE);
+    emitEvent("state", "state", "ready");
   }
 
-  // Idle: keep WiFi alive and stay responsive to the button.
+  // Keep WiFi alive. Audio is handled entirely by the SR feed task now, so
+  // loop() has nothing to do between takes.
   static uint32_t lastWifiCheck = 0;
   if (millis() - lastWifiCheck > 10000) {
     lastWifiCheck = millis();
@@ -565,5 +779,5 @@ void loop() {
       WiFi.reconnect();
     }
   }
-  delay(5);
+  delay(10);
 }
