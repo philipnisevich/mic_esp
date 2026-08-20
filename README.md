@@ -122,6 +122,46 @@ SR's feed task, its detect task, and `loop()`.
 | `VAD_MIN_SPEECH_MS` | 400 | ...but never before this much audio |
 | `VAD_NOISE_MULT` | 3.0 | speech = this much above the tracked noise floor |
 
+## Asking a model
+
+After transcription the text goes to an OpenAI chat model and the reply is
+shown on the OLED and emitted on serial as `{"type":"answer","text":"..."}`.
+Set `OPENAI_API_KEY` and `OPENAI_MODEL` in `config.h`.
+
+The request sends only `model` and `messages`. Optional fields like the token
+cap are deliberately omitted: the correct name differs by model family
+(`max_tokens` on older chat models, `max_completion_tokens` on newer ones) and
+sending the wrong one is a 400, not a graceful degrade. Reply length is steered
+by `OPENAI_SYSTEM_PROMPT` instead, which asks for at most two plain-text
+sentences so answers fit the screen. `OPENAI_MAX_COMPLETION_TOKENS` is there,
+commented out, if you want a hard cap.
+
+Note this is a plain chat model with no tools or live data, so "what is the
+weather" gets a polite refusal rather than a forecast.
+
+## OLED display
+
+A 0.96" SSD1306 over I2C. Four wires:
+
+| OLED pin | ESP32-S3 | Note |
+|---|---|---|
+| VCC | 3V3 | most 0.96" modules are 3.3 V parts |
+| GND | GND | |
+| SCL | GPIO 9 | I2C clock (`PIN_I2C_SCL`) |
+| SDA | GPIO 8 | I2C data (`PIN_I2C_SDA`) |
+
+These are the S3's default `Wire` pins and are clear of the I2S pins. No reset
+or chip-select line is needed and the module carries its own pull-ups. The
+firmware probes `0x3C` then `0x3D` and logs which it found, or
+`no OLED found at 0x3C/0x3D` if neither answers. Everything else still works
+without a display attached.
+
+The screen shows an inverted header bar with the current state
+(`Ready`/`Listening`/`Transcribing`/`You said`/`Nova`) over word-wrapped body
+text. Replies longer than one screen paginate every 3.5 s with a `1/3` counter,
+and the last answer stays up until the next take. Set `OLED_HEIGHT` to 32 in
+`config.h` for the half-height modules.
+
 ## Serial protocol
 
 Two kinds of line come out of the board, so a bridge never has to guess:
@@ -133,6 +173,8 @@ Two kinds of line come out of the board, so a bridge never has to guess:
 {"type":"state","state":"recording"}
 {"type":"state","state":"transcribing"}
 {"type":"transcript","text":"testing one two three","language":"eng"}
+{"type":"answer","text":"Paris is the capital of France."}
+{"type":"noise","reason":"below speech threshold"}
 {"type":"error","error":"http 401: {\"detail\":...}"}
 ```
 

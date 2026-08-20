@@ -24,6 +24,9 @@
 #include <ArduinoJson.h>
 #include <ESP_I2S.h>
 #include <ESP_SR.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 #include "config.h"
 
@@ -42,6 +45,11 @@ static const int PIN_I2S_DIN  = 6;
 // Push-to-talk button, wired between the pin and GND. GPIO0 is the BOOT
 // button on most S3 dev boards, so this works with no extra hardware.
 static const int PIN_BUTTON = 0;
+
+// SSD1306 OLED over I2C. These are the S3's default Wire pins.
+//   VCC -> 3V3, GND -> GND, SCL -> GPIO9, SDA -> GPIO8
+static const int PIN_I2C_SDA = 8;
+static const int PIN_I2C_SCL = 9;
 
 // INMP441 with L/R tied low sits in the left slot.
 static const i2s_std_slot_mask_t MIC_SLOT = I2S_STD_SLOT_LEFT;
@@ -132,6 +140,137 @@ static int32_t *gScratch      = nullptr;
 static size_t   gScratchCount = 0;
 
 static inline int16_t *pcm() { return (int16_t *)(gBuffer + WAV_HEADER_SIZE); }
+
+// --------------------------------------------------------------- display ---
+static Adafruit_SSD1306 gOled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+static bool gOledReady = false;
+
+// Wrapped text is paged rather than scrolled: simpler, and easier to read on a
+// screen this small. 6x8 font -> 21 columns, 8 rows, one row spent on the header.
+static const uint8_t OLED_COLS  = OLED_WIDTH / 6;
+static const uint8_t OLED_ROWS  = OLED_HEIGHT / 8;
+static const uint8_t BODY_ROWS  = OLED_ROWS - 1;
+static const uint8_t MAX_LINES  = BODY_ROWS * 4;  // cap at four pages
+
+static char     gLines[MAX_LINES][OLED_WIDTH / 6 + 1];
+static uint8_t  gLineCount = 0;
+static uint8_t  gPage = 0;
+static uint32_t gPageShownMs = 0;
+static char     gHeader[24] = "";
+static const uint32_t PAGE_DWELL_MS = 3500;
+
+// Greedy word wrap into gLines. Words longer than a line get hard-split.
+static void wrapText(const char *text) {
+  gLineCount = 0;
+  if (!text) return;
+
+  size_t col = 0;
+  gLines[0][0] = '\0';
+
+  while (*text && gLineCount < MAX_LINES) {
+    while (*text == ' ' || *text == '\n' || *text == '\r' || *text == '\t') text++;
+    if (!*text) break;
+
+    const char *wordEnd = text;
+    while (*wordEnd && *wordEnd != ' ' && *wordEnd != '\n' && *wordEnd != '\r' && *wordEnd != '\t') {
+      wordEnd++;
+    }
+    size_t wordLen = (size_t)(wordEnd - text);
+
+    if (wordLen > OLED_COLS) {  // no wrap point: hard-split it
+      while (wordLen && gLineCount < MAX_LINES) {
+        size_t room = OLED_COLS - col;
+        size_t take = wordLen < room ? wordLen : room;
+        memcpy(gLines[gLineCount] + col, text, take);
+        col += take;
+        gLines[gLineCount][col] = '\0';
+        text += take;
+        wordLen -= take;
+        if (col >= OLED_COLS) {
+          gLineCount++;
+          col = 0;
+          if (gLineCount < MAX_LINES) gLines[gLineCount][0] = '\0';
+        }
+      }
+      continue;
+    }
+
+    if (col > 0 && col + 1 + wordLen > OLED_COLS) {
+      gLineCount++;
+      col = 0;
+      if (gLineCount >= MAX_LINES) break;
+      gLines[gLineCount][0] = '\0';
+    }
+    if (col > 0) gLines[gLineCount][col++] = ' ';
+    memcpy(gLines[gLineCount] + col, text, wordLen);
+    col += wordLen;
+    gLines[gLineCount][col] = '\0';
+    text = wordEnd;
+  }
+
+  if (col > 0 && gLineCount < MAX_LINES) gLineCount++;
+}
+
+static void oledRenderPage() {
+  if (!gOledReady) return;
+  gOled.clearDisplay();
+
+  // Header bar, inverted so state is readable at a glance.
+  gOled.fillRect(0, 0, OLED_WIDTH, 8, SSD1306_WHITE);
+  gOled.setTextColor(SSD1306_BLACK);
+  gOled.setCursor(0, 0);
+  gOled.print(gHeader);
+
+  uint8_t pages = gLineCount ? (uint8_t)((gLineCount + BODY_ROWS - 1) / BODY_ROWS) : 1;
+  if (pages > 1) {
+    char tag[8];
+    snprintf(tag, sizeof(tag), "%u/%u", (unsigned)(gPage + 1), (unsigned)pages);
+    gOled.setCursor(OLED_WIDTH - (int)strlen(tag) * 6, 0);
+    gOled.print(tag);
+  }
+
+  gOled.setTextColor(SSD1306_WHITE);
+  uint8_t first = gPage * BODY_ROWS;
+  for (uint8_t i = 0; i < BODY_ROWS && (first + i) < gLineCount; i++) {
+    gOled.setCursor(0, 8 + i * 8);
+    gOled.print(gLines[first + i]);
+  }
+  gOled.display();
+}
+
+static void oledShow(const char *header, const char *body) {
+  snprintf(gHeader, sizeof(gHeader), "%s", header ? header : "");
+  wrapText(body);
+  gPage = 0;
+  gPageShownMs = millis();
+  oledRenderPage();
+}
+
+// Advance long answers a page at a time so everything eventually gets read.
+static void oledTick() {
+  if (!gOledReady || gLineCount <= BODY_ROWS) return;
+  if (millis() - gPageShownMs < PAGE_DWELL_MS) return;
+  uint8_t pages = (uint8_t)((gLineCount + BODY_ROWS - 1) / BODY_ROWS);
+  gPage = (uint8_t)((gPage + 1) % pages);
+  gPageShownMs = millis();
+  oledRenderPage();
+}
+
+static bool oledBegin() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  // 0x3C is standard; a minority of modules are strapped to 0x3D.
+  for (uint8_t addr = 0x3C; addr <= 0x3D; addr++) {
+    if (gOled.begin(SSD1306_SWITCHCAPVCC, addr)) {
+      gOledReady = true;
+      gOled.setTextSize(1);
+      gOled.setTextWrap(false);
+      logf("oled ok at 0x%02X on sda=%d scl=%d", addr, PIN_I2C_SDA, PIN_I2C_SCL);
+      return true;
+    }
+  }
+  logf("no OLED found at 0x3C/0x3D - check SDA=%d SCL=%d and 3V3", PIN_I2C_SDA, PIN_I2C_SCL);
+  return false;
+}
 
 // ------------------------------------------------------------ status LED ---
 // Plain constants rather than an enum: the .ino preprocessor hoists function
@@ -546,7 +685,7 @@ static bool isNonSpeech(const char *text) {
 }
 
 // ----------------------------------------------------------- elevenlabs ----
-static bool transcribe(size_t pcmBytes) {
+static bool transcribe(size_t pcmBytes, String &outText) {
   if (WiFi.status() != WL_CONNECTED) {
     emitEvent("error", "error", "wifi not connected");
     return false;
@@ -638,10 +777,109 @@ static bool transcribe(size_t pcmBytes) {
   if (isNonSpeech(text)) {
     logf("no speech in result, discarding: %s", text);
     emitEvent("noise", "text", text);
+    outText = "";
     return true;
   }
 
+  outText = text;
   emitTranscript(text, lang);
+  return true;
+}
+
+// --------------------------------------------------------------- openai ----
+// Send the transcript on to a chat model and hand back its reply. Deliberately
+// minimal: only model + messages, because optional fields like the token cap
+// have different names across model families and sending the wrong one is a
+// 400 rather than a graceful degrade. Reply length is steered by the system
+// prompt instead.
+static bool askOpenAI(const char *question, String &answer) {
+  if (WiFi.status() != WL_CONNECTED) {
+    emitEvent("error", "error", "wifi not connected");
+    return false;
+  }
+
+  JsonDocument req;
+  req["model"] = OPENAI_MODEL;
+#ifdef OPENAI_MAX_COMPLETION_TOKENS
+  req["max_completion_tokens"] = OPENAI_MAX_COMPLETION_TOKENS;
+#endif
+  JsonArray messages = req["messages"].to<JsonArray>();
+  JsonObject sys = messages.add<JsonObject>();
+  sys["role"] = "system";
+  sys["content"] = OPENAI_SYSTEM_PROMPT;
+  JsonObject usr = messages.add<JsonObject>();
+  usr["role"] = "user";
+  usr["content"] = question;
+
+  String body;
+  serializeJson(req, body);
+
+  NetworkClientSecure client;
+#ifdef OPENAI_ROOT_CA
+  client.setCACert(OPENAI_ROOT_CA);
+#else
+  client.setInsecure();
+#endif
+  client.setHandshakeTimeout(15);
+
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(45000);
+  http.setReuse(false);
+
+  if (!http.begin(client, "https://api.openai.com/v1/chat/completions")) {
+    emitEvent("error", "error", "openai http begin failed");
+    return false;
+  }
+  http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+  http.addHeader("Content-Type", "application/json");
+
+  logf("asking %s...", OPENAI_MODEL);
+  uint32_t t0 = millis();
+  int code = http.POST(body);
+
+  if (code <= 0) {
+    String err = HTTPClient::errorToString(code);
+    logf("openai transport error: %s", err.c_str());
+    http.end();
+    logNetworkDiagnostics();
+    emitEvent("error", "error", err.c_str());
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  logf("openai http %d in %lu ms", code, (unsigned long)(millis() - t0));
+
+  // Only pull out the two fields we care about - the full response carries a
+  // lot of metadata we would otherwise have to find heap for.
+  JsonDocument filter;
+  filter["choices"][0]["message"]["content"] = true;
+  filter["error"]["message"] = true;
+
+  JsonDocument doc;
+  DeserializationError jsonErr = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  if (jsonErr) {
+    emitEvent("error", "error", jsonErr.c_str());
+    return false;
+  }
+
+  if (code != HTTP_CODE_OK) {
+    const char *msg = doc["error"]["message"] | "";
+    String detail = String("openai ") + code + ": " + (msg[0] ? msg : payload.substring(0, 160).c_str());
+    logf("%s", detail.c_str());
+    emitEvent("error", "error", detail.c_str());
+    return false;
+  }
+
+  const char *content = doc["choices"][0]["message"]["content"] | "";
+  if (!content[0]) {
+    emitEvent("error", "error", "openai returned an empty reply");
+    return false;
+  }
+
+  answer = content;
+  answer.trim();
   return true;
 }
 
@@ -669,6 +907,7 @@ static void connectWiFi() {
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   logf("connecting to %s", WIFI_SSID);
+  oledShow("WiFi", WIFI_SSID);
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
@@ -748,6 +987,9 @@ void setup() {
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
+  oledBegin();
+  oledShow("MicScribe", "Booting...");
+
   if (!allocateBuffer()) {
     logf("FATAL: could not allocate the audio buffer");
     while (true) {
@@ -777,6 +1019,7 @@ void setup() {
   }
 
   setStatus(STATUS_IDLE);
+  oledShow("Ready", "Say \"Hey Nova\" or hold the button");
   logf("ready - say \"Hey Nova\", or hold GPIO%d to talk", PIN_BUTTON);
   emitEvent("state", "state", "ready");
 }
@@ -784,9 +1027,19 @@ void setup() {
 void loop() {
   gButtonHeld = buttonPressedStable();
 
-  if (gState == ST_CAPTURING) {
-    setStatus(STATUS_RECORDING);
+  // Edge-trigger the display so a finished answer stays on screen instead of
+  // being redrawn (and reset to page 1) on every pass through loop().
+  static uint8_t lastState = 255;
+  uint8_t st = gState;
+  if (st != lastState) {
+    lastState = st;
+    if (st == ST_CAPTURING) {
+      setStatus(STATUS_RECORDING);
+      oledShow("Listening", gManualCapture ? "Hold to talk..." : "Go ahead...");
+    }
   }
+
+  oledTick();
 
   if (gState == ST_PENDING) {
     gState = ST_UPLOADING;
@@ -815,10 +1068,31 @@ void loop() {
       writeWavHeader(gBuffer, pcmBytes);
 
       setStatus(STATUS_WORKING);
+      oledShow("Transcribing", "...");
       emitEvent("state", "state", "transcribing");
 
-      bool ok = transcribe(pcmBytes);
-      setStatus(ok ? STATUS_OK : STATUS_ERROR);
+      String question;
+      bool ok = transcribe(pcmBytes, question);
+
+      if (ok && question.length() > 0) {
+        // Leave the question up while the model thinks - it doubles as
+        // feedback that the transcription was right.
+        oledShow("You said", question.c_str());
+        emitEvent("state", "state", "thinking");
+
+        String answer;
+        if (askOpenAI(question.c_str(), answer)) {
+          emitEvent("answer", "text", answer.c_str());
+          oledShow("Nova", answer.c_str());
+          setStatus(STATUS_OK);
+        } else {
+          oledShow("Error", "Could not reach OpenAI");
+          setStatus(STATUS_ERROR);
+        }
+      } else {
+        setStatus(ok ? STATUS_OK : STATUS_ERROR);
+        if (!ok) oledShow("Error", "Transcription failed");
+      }
       delay(400);
     }
 
@@ -826,6 +1100,7 @@ void loop() {
     gWakeRequested = false;
     ringReset();
     gState = ST_LISTENING;
+    lastState = ST_LISTENING;      // do not repaint over the answer
     sr_set_mode(SR_MODE_COMMAND);  // make sure the detector is armed again
     setStatus(STATUS_IDLE);
     emitEvent("state", "state", "ready");

@@ -131,6 +131,10 @@ def handle_line(line, args):
             copy_to_clipboard(text)
         if args.type:
             type_text(text)
+    elif kind == "answer":
+        # The model's reply. Printed, not typed - --type stays bound to
+        # transcripts so dictation keeps working as before.
+        print(f"\033[96m\u2726\033[0m {event.get('text', '')}")
     elif kind == "noise":
         # Non-speech: a false wake, or a stray tap. Never type or copy this.
         if args.verbose:
