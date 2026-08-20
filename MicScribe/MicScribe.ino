@@ -64,6 +64,21 @@ static const uint32_t VAD_MIN_SPEECH_MS = 400; // ...but never before this much
 static const float    VAD_NOISE_MULT  = 3.0f;  // speech = this x the noise floor
 static const uint32_t VAD_MIN_LEVEL   = 250;   // absolute floor for a dead-quiet room
 
+// A take whose loudest sample never gets above this almost certainly contains
+// no speech - a false wake on room noise, or a stray button tap. Cheap to
+// check, and it saves an API call. Real speech peaks around 5000-8000 with
+// MIC_GAIN at 4.0; an idle room false-accept measured 271.
+static const int32_t  SPEECH_MIN_PEAK = 1200;
+
+// After the wake word, wait this long for you to actually start talking before
+// giving up. Without it the silence timer starts counting immediately and the
+// take ends ~800 ms after the wake word if you pause to think.
+static const uint32_t WAKE_LEAD_IN_MS = 5000;
+// Detection fires as the phrase finishes, so the first moments of live audio
+// can still hold the tail of "Nova". Ignore them, or that tail counts as
+// speech and the silence timer starts anyway - reintroducing the same bug.
+static const uint32_t WAKE_BLANK_MS = 250;
+
 static const size_t WAV_HEADER_SIZE = 44;
 static const size_t I2S_CHUNK_FRAMES = 256;  // 16 ms per read at 16 kHz
 
@@ -109,6 +124,8 @@ static bool     gRingWrapped = false;
 static float    gNoiseFloor = 200.0f;
 static uint32_t gSilenceMs  = 0;
 static uint32_t gCapturedMs = 0;
+static size_t   gPrerollSamples = 0;  // how much of a take is replayed pre-roll
+static bool     gSpeechSeen = false;  // has the talking actually started yet?
 
 // Scratch for the 32-bit I2S reads that get converted down to 16-bit.
 static int32_t *gScratch      = nullptr;
@@ -320,6 +337,7 @@ static void startCapture(bool manual) {
   gSilenceMs = 0;
   gCapturedMs = 0;
   gManualCapture = manual;
+  gSpeechSeen = false;
   gEndReason = "";
 
   // Replay the pre-roll so the take does not begin mid-word.
@@ -331,6 +349,7 @@ static void startCapture(bool manual) {
       appendSamples(gRing, gRingPos);
     }
   }
+  gPrerollSamples = gSamples;  // everything so far is pre-roll, not live audio
   ringReset();
   gState = ST_CAPTURING;
 }
@@ -368,15 +387,21 @@ static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
 
   if (gManualCapture) {
     if (!gButtonHeld) endCapture("button released");
-  } else {
+  } else if (gCapturedMs >= WAKE_BLANK_MS) {
+    // gCapturedMs counts live audio only - the pre-roll is not added to it.
     float threshold = gNoiseFloor * VAD_NOISE_MULT;
     if (threshold < (float)VAD_MIN_LEVEL) threshold = (float)VAD_MIN_LEVEL;
-    if ((float)level < threshold) {
-      gSilenceMs += chunkMs;
-    } else {
+
+    if ((float)level >= threshold) {
+      gSpeechSeen = true;
       gSilenceMs = 0;
+    } else if (gSpeechSeen) {
+      gSilenceMs += chunkMs;  // only meaningful once talking has begun
     }
-    if (gSilenceMs >= VAD_SILENCE_MS && gCapturedMs >= VAD_MIN_SPEECH_MS) {
+
+    if (!gSpeechSeen) {
+      if (gCapturedMs >= WAKE_LEAD_IN_MS) endCapture("no speech after wake");
+    } else if (gSilenceMs >= VAD_SILENCE_MS && gCapturedMs >= VAD_MIN_SPEECH_MS) {
       endCapture("silence");
     }
   }
@@ -433,6 +458,9 @@ static void srEvent(void *arg, sr_event_t event, int command_id, int phrase_id) 
       if (gState == ST_LISTENING) {
         gWakeRequested = true;
       }
+      // MultiNet stops detecting after a hit until the mode is set again, so
+      // without this the wake word works exactly once per boot.
+      sr_set_mode(SR_MODE_COMMAND);
       break;
     case SR_EVENT_TIMEOUT:
       // Command mode times out on its own; we want it listening forever.
@@ -497,6 +525,24 @@ static void logNetworkDiagnostics() {
     int code = tls.lastError(err, sizeof(err));
     logf("tls: handshake FAILED (%d) %s", code, err);
   }
+}
+
+// Scribe returns bracketed event tags like "[typing]", "[silence]" or
+// "[keyboard clacking]" when it hears no speech. Those are not transcripts and
+// must never be typed into whatever the user has focused, so treat a result
+// that is nothing but tags (or empty) as noise.
+static bool isNonSpeech(const char *text) {
+  if (!text) return true;
+  const char *p = text;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!*p) break;
+    if (*p != '[') return false;  // real words are present
+    const char *close = strchr(p, ']');
+    if (!close) return false;
+    p = close + 1;
+  }
+  return true;  // only tags, or nothing at all
 }
 
 // ----------------------------------------------------------- elevenlabs ----
@@ -588,6 +634,13 @@ static bool transcribe(size_t pcmBytes) {
 
   const char *text = doc["text"] | "";
   const char *lang = doc["language_code"] | "";
+
+  if (isNonSpeech(text)) {
+    logf("no speech in result, discarding: %s", text);
+    emitEvent("noise", "text", text);
+    return true;
+  }
+
   emitTranscript(text, lang);
   return true;
 }
@@ -742,14 +795,22 @@ void loop() {
     size_t pcmBytes = samples * 2;
     float seconds = samples / (float)SAMPLE_RATE;
 
-    logf("captured %.2f s (%s), peak %d", seconds, gEndReason, (int)gPeak);
+    // The pre-roll is replayed padding, not audio the user actually gave us,
+    // so the minimum-length check has to discount it or a 20 ms button tap
+    // sails through as a "300 ms" take.
+    size_t liveSamples = samples > gPrerollSamples ? samples - gPrerollSamples : 0;
+    uint32_t liveMs = (uint32_t)((liveSamples * 1000) / SAMPLE_RATE);
 
-    if (samples == 0 || (uint32_t)(seconds * 1000) < MIN_RECORD_MS) {
+    logf("captured %.2f s (%s, %lu ms live), peak %d",
+         seconds, gEndReason, (unsigned long)liveMs, (int)gPeak);
+
+    if (samples == 0 || liveMs < MIN_RECORD_MS) {
       logf("too short, ignoring");
+    } else if (gPeak < SPEECH_MIN_PEAK) {
+      // Almost certainly a false wake on room noise. Don't spend an API call.
+      logf("no speech (peak %d < %d), skipping upload", (int)gPeak, (int)SPEECH_MIN_PEAK);
+      emitEvent("noise", "reason", "below speech threshold");
     } else {
-      if (gPeak < 200) {
-        logf("WARNING: signal is nearly silent - check mic wiring and MIC_SLOT");
-      }
       normalise();
       writeWavHeader(gBuffer, pcmBytes);
 
@@ -765,6 +826,7 @@ void loop() {
     gWakeRequested = false;
     ringReset();
     gState = ST_LISTENING;
+    sr_set_mode(SR_MODE_COMMAND);  // make sure the detector is armed again
     setStatus(STATUS_IDLE);
     emitEvent("state", "state", "ready");
   }

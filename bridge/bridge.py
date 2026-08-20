@@ -131,6 +131,11 @@ def handle_line(line, args):
             copy_to_clipboard(text)
         if args.type:
             type_text(text)
+    elif kind == "noise":
+        # Non-speech: a false wake, or a stray tap. Never type or copy this.
+        if args.verbose:
+            detail = event.get("text") or event.get("reason") or ""
+            print(f"\033[90m· noise discarded {detail}\033[0m")
     elif kind == "error":
         print(f"\033[91m! {event.get('error')}\033[0m", file=sys.stderr)
     elif kind == "state" and args.verbose:
