@@ -27,19 +27,31 @@
 #define OPENAI_API_KEY "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 // Pick something fast - this sits in the round trip the user is waiting on.
-#define OPENAI_MODEL "gpt-4o-mini"
+#define OPENAI_MODEL "gpt-4.1-nano"
 
 // Keep answers short: they have to fit a 128x64 screen and be read aloud-ish.
 #define OPENAI_SYSTEM_PROMPT \
-  "You are Nova, a voice assistant on a tiny device with a 128x64 screen. " \
-  "Answer in at most 2 short sentences. Plain text only - no markdown, no " \
-  "lists, no emoji. If you do not know, say so briefly."
+  "You are Nova, a voice assistant with a tiny screen. Answer in ONE short " \
+  "sentence, 20 words maximum. Give the answer directly with no preamble, no " \
+  "restating the question, and no offers of further help. Plain text only: no " \
+  "markdown, lists, or emoji. If you do not know, say so in a few words."
 
 // Optional hard cap on the reply. Left out by default because the correct
 // field name varies by model family (max_tokens on older chat models,
 // max_completion_tokens on newer ones) and sending the wrong one is a 400.
 // The system prompt already keeps replies short.
 // #define OPENAI_MAX_COMPLETION_TOKENS 150
+
+// Questions about live facts go to a search-backed model instead. It is far
+// slower and vastly more expensive per call (measured: 5.7 s / 16.5k tokens
+// versus 0.7 s / 37 tokens), so it is used only when the question needs it.
+#define OPENAI_SEARCH_MODEL "gpt-5-search-api"
+
+#define OPENAI_SEARCH_SYSTEM_PROMPT \
+  "You are Nova, a voice assistant with a tiny screen. Use the search results " \
+  "to answer in at most two short sentences. Lead with the fact, and include " \
+  "the date only if it matters. Plain text only: no markdown, no URLs, no " \
+  "citations, no emoji."
 
 // ------------------------------------------------------------------ oled ---
 // 0.96" SSD1306 over I2C. 128x64 is the usual 0.96" panel; set 32 for the

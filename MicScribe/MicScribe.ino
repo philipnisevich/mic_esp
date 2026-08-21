@@ -159,6 +159,58 @@ static uint32_t gPageShownMs = 0;
 static char     gHeader[24] = "";
 static const uint32_t PAGE_DWELL_MS = 3500;
 
+// The GFX default font is CP437, so UTF-8 multi-byte sequences render as pairs
+// of garbage glyphs. Search answers are full of them - degree signs, curly
+// quotes, en-dashes - so fold the common ones to ASCII and drop the rest.
+static void asciiFold(const char *src, char *dst, size_t dstLen) {
+  size_t o = 0;
+  const uint8_t *p = (const uint8_t *)src;
+  while (*p && o + 1 < dstLen) {
+    if (*p < 0x80) {
+      // The prompt asks for plain text and the models emit markdown anyway, so
+      // drop the markers rather than draw "**$315.45**" literally.
+      if (*p == '*' || *p == '`') { p++; continue; }
+      if (*p == '#' && (o == 0 || dst[o - 1] == '\n')) { p++; continue; }
+      dst[o++] = (char)*p++;
+      continue;
+    }
+
+    // Decode just enough of the code point to recognise the ones we care about.
+    uint32_t cp = 0;
+    int len = 1;
+    if ((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; len = 2; }
+    else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; len = 3; }
+    else if ((*p & 0xF8) == 0xF0) { cp = *p & 0x07; len = 4; }
+    for (int i = 1; i < len; i++) {
+      if ((p[i] & 0xC0) != 0x80) { len = i; break; }
+      cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    p += len;
+
+    const char *sub = nullptr;
+    switch (cp) {
+      case 0x00B0: sub = "deg"; break;                    // degree sign
+      case 0x2018: case 0x2019: sub = "'"; break;         // curly single quotes
+      case 0x201C: case 0x201D: sub = "\""; break;        // curly double quotes
+      case 0x2013: case 0x2014: sub = "-"; break;         // en/em dash
+      case 0x2212: sub = "-"; break;                      // true minus: dropping
+                                                          // this turns -0.44% into
+                                                          // 0.44%, silently
+                                                          // inverting the meaning
+      case 0x00D7: sub = "x"; break;                      // multiplication sign
+      case 0x2022: sub = "-"; break;                      // bullet
+      case 0x2026: sub = "..."; break;                    // ellipsis
+      case 0x00A0: sub = " "; break;                      // non-breaking space
+      case 0x00BD: sub = "1/2"; break;
+      default: break;                                     // anything else: drop
+    }
+    if (sub) {
+      while (*sub && o + 1 < dstLen) dst[o++] = *sub++;
+    }
+  }
+  dst[o] = '\0';
+}
+
 // Greedy word wrap into gLines. Words longer than a line get hard-split.
 static void wrapText(const char *text) {
   gLineCount = 0;
@@ -240,7 +292,9 @@ static void oledRenderPage() {
 
 static void oledShow(const char *header, const char *body) {
   snprintf(gHeader, sizeof(gHeader), "%s", header ? header : "");
-  wrapText(body);
+  static char folded[512];
+  asciiFold(body ? body : "", folded, sizeof(folded));
+  wrapText(folded);
   gPage = 0;
   gPageShownMs = millis();
   oledRenderPage();
@@ -786,27 +840,154 @@ static bool transcribe(size_t pcmBytes, String &outText) {
   return true;
 }
 
+// -------------------------------------------------------------- routing ----
+// Anything touching live facts needs the search-backed model; everything else
+// gets the fast cheap one. Deliberately a keyword test rather than asking a
+// model to classify: this runs in microseconds on-device, where a routing
+// round trip would cost more than the answer itself.
+//
+// Phrases are specific on purpose. Bare "current", "hours" and "who is the"
+// were tried first and misrouted "current limit an LED", "how many hours in a
+// day" and "who is the author of Hamlet" - each of which would have cost ~450x
+// the tokens of a correct route. Prefer missing a search over taking one:
+// "search ..." and "look up ..." are always available as an override.
+static const char *RESEARCH_KEYWORDS[] = {
+  "weather", "forecast", "temperature", "raining", "snowing",
+  "news", "headline", "happening now", "breaking news",
+  "today", "tonight", "tomorrow", "yesterday", "this week", "this month",
+  "latest", "currently", "right now", "recently", "just now",
+  "who won", "final score", "score of", "standings", "who is playing", "who's playing",
+  "stock price", "share price", "how much does", "cost of",
+  "open now", "still open", "what time does", "schedule for", "released",
+  "election", "president of", "prime minister", "live score", "live stream",
+  "play next", "playing next", "next game", "next match", "next fixture",
+  "kick off", "kickoff",
+};
+
+// A domain almost always means "go look this up". The fast model will happily
+// invent a description of a site it has never seen.
+static const char *RESEARCH_TLDS[] = {
+  ".com", ".io", ".org", ".net", ".ai", ".dev", ".gov", ".edu",
+};
+
+static bool needsResearch(const String &question) {
+  String lower = question;
+  lower.toLowerCase();
+
+  // Explicit override, so you are never stuck when the heuristic misses.
+  if (lower.startsWith("search") || lower.startsWith("look up")) return true;
+
+  for (size_t i = 0; i < sizeof(RESEARCH_KEYWORDS) / sizeof(RESEARCH_KEYWORDS[0]); i++) {
+    if (lower.indexOf(RESEARCH_KEYWORDS[i]) >= 0) return true;
+  }
+
+  for (size_t i = 0; i < sizeof(RESEARCH_TLDS) / sizeof(RESEARCH_TLDS[0]); i++) {
+    if (lower.indexOf(RESEARCH_TLDS[i]) >= 0) return true;
+  }
+
+  // A 20xx year almost always means "look this up".
+  for (int i = 0; i + 3 < (int)lower.length(); i++) {
+    if (lower[i] == '2' && lower[i + 1] == '0' &&
+        isdigit((unsigned char)lower[i + 2]) && isdigit((unsigned char)lower[i + 3])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The 300 ms pre-roll regularly catches the tail of the wake phrase, so
+// transcripts arrive as "Hey Nova, what's the weather". Strip it here rather
+// than shrinking the pre-roll, which would just start clipping real speech.
+static void stripWakePhrase(String &question) {
+  static const char *PREFIXES[] = {"hey nova", "hi nova", "okay nova", "ok nova", "nova"};
+  String lower = question;
+  lower.toLowerCase();
+
+  for (size_t i = 0; i < sizeof(PREFIXES) / sizeof(PREFIXES[0]); i++) {
+    size_t len = strlen(PREFIXES[i]);
+    if (!lower.startsWith(PREFIXES[i])) continue;
+    // Require a word boundary, or "nova" would eat the start of "Novak".
+    if (question.length() > len && isalnum((unsigned char)question[len])) continue;
+
+    size_t cut = len;
+    while (cut < question.length() &&
+           (question[cut] == ',' || question[cut] == '.' || question[cut] == '!' ||
+            question[cut] == '?' || question[cut] == ' ')) {
+      cut++;
+    }
+    if (cut >= question.length()) return;  // nothing but the wake phrase
+    question = question.substring(cut);
+    question.trim();
+    return;
+  }
+}
+
+// The fast model refuses live-data questions in very consistent language. Treat
+// that as a routing miss and retry on the search path: it costs an extra call
+// only when the keywords missed, and turns a dead end into an answer.
+// Both a negation and a liveness reference are required, so an answer that
+// merely discusses "real-time systems" is not mistaken for a refusal.
+static bool isRefusal(const String &answer) {
+  static const char *NEGATIONS[] = {
+    "i can't", "i cannot", "i don't have", "i do not have",
+    "i'm unable", "i am unable", "not able to", "sorry,",
+  };
+  static const char *LIVENESS[] = {
+    "real-time", "real time", "current data", "live data", "up-to-date",
+    "up to date", "browse", "internet access", "knowledge cutoff",
+    "as of my last", "current information", "latest information",
+  };
+
+  String lower = answer;
+  lower.toLowerCase();
+
+  bool negated = false;
+  for (size_t i = 0; i < sizeof(NEGATIONS) / sizeof(NEGATIONS[0]); i++) {
+    if (lower.indexOf(NEGATIONS[i]) >= 0) { negated = true; break; }
+  }
+  if (!negated) return false;
+
+  for (size_t i = 0; i < sizeof(LIVENESS) / sizeof(LIVENESS[0]); i++) {
+    if (lower.indexOf(LIVENESS[i]) >= 0) return true;
+  }
+  return false;
+}
+
+static void emitAnswer(const char *text, const char *model, bool researched) {
+  JsonDocument doc;
+  doc["type"] = "answer";
+  doc["text"] = text;
+  doc["model"] = model;
+  doc["research"] = researched;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
 // --------------------------------------------------------------- openai ----
 // Send the transcript on to a chat model and hand back its reply. Deliberately
 // minimal: only model + messages, because optional fields like the token cap
 // have different names across model families and sending the wrong one is a
 // 400 rather than a graceful degrade. Reply length is steered by the system
 // prompt instead.
-static bool askOpenAI(const char *question, String &answer) {
+static bool askOpenAI(const char *question, String &answer, bool research) {
   if (WiFi.status() != WL_CONNECTED) {
     emitEvent("error", "error", "wifi not connected");
     return false;
   }
 
+  const char *model  = research ? OPENAI_SEARCH_MODEL : OPENAI_MODEL;
+  const char *sysMsg = research ? OPENAI_SEARCH_SYSTEM_PROMPT : OPENAI_SYSTEM_PROMPT;
+
   JsonDocument req;
-  req["model"] = OPENAI_MODEL;
+  req["model"] = model;
 #ifdef OPENAI_MAX_COMPLETION_TOKENS
-  req["max_completion_tokens"] = OPENAI_MAX_COMPLETION_TOKENS;
+  // The search model needs room for its results, so only cap the fast path.
+  if (!research) req["max_completion_tokens"] = OPENAI_MAX_COMPLETION_TOKENS;
 #endif
   JsonArray messages = req["messages"].to<JsonArray>();
   JsonObject sys = messages.add<JsonObject>();
   sys["role"] = "system";
-  sys["content"] = OPENAI_SYSTEM_PROMPT;
+  sys["content"] = sysMsg;
   JsonObject usr = messages.add<JsonObject>();
   usr["role"] = "user";
   usr["content"] = question;
@@ -834,7 +1015,7 @@ static bool askOpenAI(const char *question, String &answer) {
   http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
   http.addHeader("Content-Type", "application/json");
 
-  logf("asking %s...", OPENAI_MODEL);
+  logf("asking %s%s...", model, research ? " (search)" : "");
   uint32_t t0 = millis();
   int code = http.POST(body);
 
@@ -1077,12 +1258,25 @@ void loop() {
       if (ok && question.length() > 0) {
         // Leave the question up while the model thinks - it doubles as
         // feedback that the transcription was right.
-        oledShow("You said", question.c_str());
-        emitEvent("state", "state", "thinking");
+        stripWakePhrase(question);
+        bool research = needsResearch(question);
+        oledShow(research ? "Searching" : "You said", question.c_str());
+        emitEvent("state", "state", research ? "searching" : "thinking");
 
         String answer;
-        if (askOpenAI(question.c_str(), answer)) {
-          emitEvent("answer", "text", answer.c_str());
+        if (askOpenAI(question.c_str(), answer, research)) {
+          // Backstop for anything the keyword router missed.
+          if (!research && isRefusal(answer)) {
+            logf("fast model refused - retrying on the search path");
+            oledShow("Searching", question.c_str());
+            emitEvent("state", "state", "searching");
+            String retried;
+            if (askOpenAI(question.c_str(), retried, true) && retried.length()) {
+              answer = retried;
+              research = true;
+            }
+          }
+          emitAnswer(answer.c_str(), research ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, research);
           oledShow("Nova", answer.c_str());
           setStatus(STATUS_OK);
         } else {

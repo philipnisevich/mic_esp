@@ -134,7 +134,10 @@ def handle_line(line, args):
     elif kind == "answer":
         # The model's reply. Printed, not typed - --type stays bound to
         # transcripts so dictation keeps working as before.
-        print(f"\033[96m\u2726\033[0m {event.get('text', '')}")
+        mark = "\u2726" if not event.get("research") else "\u2295"
+        print(f"\033[96m{mark}\033[0m {event.get('text', '')}")
+        if args.verbose and event.get("model"):
+            print(f"\033[90m   via {event['model']}\033[0m")
     elif kind == "noise":
         # Non-speech: a false wake, or a stray tap. Never type or copy this.
         if args.verbose:
