@@ -1427,13 +1427,22 @@ static bool speakerBegin() {
          PIN_AMP_BCLK, PIN_AMP_LRC);
     return false;
   }
+#if REALTIME_ENABLED
+  // The one-shot TTS path is unused here; 1.17 MB of PSRAM is better spent on
+  // the receive ring.
+  gTtsCap = 0;
+  gTtsBuf = nullptr;
+#else
   gTtsCap = (size_t)TTS_SAMPLE_RATE * 2 * TTS_MAX_SECONDS;
   gTtsBuf = (uint8_t *)ps_malloc(gTtsCap);
+#endif
+#if !REALTIME_ENABLED
   if (!gTtsBuf) {
     gTtsCap = 0;
     logf("no PSRAM for the tts buffer");
     return false;
   }
+#endif
   gSpeakerReady = true;
   logf("speaker on I2S port %d (mic is on port %d)", (int)Speaker.getPort(), (int)I2S.getPort());
   logf("speaker ok: bclk=%d lrc=%d din=%d @ %lu Hz, %u KB buffer",
@@ -1626,10 +1635,15 @@ static WebsocketsClient gWs;
 
 // Decoded 8 kHz audio waiting to be played. The socket callback fills it and
 // the session loop drains it in small blocks, so neither starves the other.
-// Audio arrives faster than it plays, so the ring has to hold a whole reply,
-// not a few seconds of it. A 10.9 s answer overran the old 10 s ring and lost
-// 0.2 s. 45 s costs 720 KB of PSRAM, of which there is 2.7 MB spare.
-static const size_t RT_RING = 8000 * 45;
+// Playback runs at 24 kHz, not the 8 kHz of the uplink: mu-law caps audio
+// bandwidth at 4 kHz, which is telephone quality and audibly thin. The API
+// accepts different formats per direction, so the microphone stays cheap while
+// the reply comes back at full rate.
+static const uint32_t RT_RX_RATE = 24000;
+
+// Audio arrives faster than it plays, so the ring holds a whole reply. 30 s at
+// 24 kHz is 1.44 MB of PSRAM.
+static const size_t RT_RING = 24000 * 30;
 static int16_t *gRtRing = nullptr;
 static volatile size_t gRtHead = 0, gRtTail = 0;
 static String gRtTranscript;
@@ -1728,18 +1742,36 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
     size_t b64Len = strlen(b64);
     if (!b64Len || !gRtRing) return;
 
-    static uint8_t decoded[4096];
+    // Sized for a whole delta, in PSRAM. 24 kHz PCM chunks are several times
+    // larger than the 8 kHz mu-law ones this started with, and a too-small
+    // buffer makes mbedtls_base64_decode fail and drop the chunk entirely -
+    // which showed up as 2400 bytes of audio for a full spoken reply.
+    static uint8_t *decoded = nullptr;
+    static size_t decodedCap = 0;
+    size_t needed = (b64Len / 4) * 3 + 4;
+    if (needed > decodedCap) {
+      uint8_t *grown = (uint8_t *)ps_realloc(decoded, needed);
+      if (!grown) {
+        gRtDropped++;
+        return;
+      }
+      decoded = grown;
+      decodedCap = needed;
+    }
+
     size_t outLen = 0;
-    if (mbedtls_base64_decode(decoded, sizeof(decoded), &outLen,
+    if (mbedtls_base64_decode(decoded, decodedCap, &outLen,
                               (const unsigned char *)b64, b64Len) != 0) {
+      gRtDropped++;
       return;
     }
     gRtRxBytes += outLen;
     gRtTurnRx += outLen;
-    for (size_t i = 0; i < outLen; i++) {
+    // Little-endian signed 16-bit, straight from the wire.
+    for (size_t i = 0; i + 1 < outLen; i += 2) {
       size_t next = (gRtHead + 1) % RT_RING;
       if (next == gRtTail) { gRtDropped++; break; }  // ring full
-      gRtRing[gRtHead] = ulawToPcm(decoded[i]);
+      gRtRing[gRtHead] = (int16_t)((uint16_t)decoded[i] | ((uint16_t)decoded[i + 1] << 8));
       gRtHead = next;
     }
     gRtSawAudio = true;
@@ -1782,7 +1814,7 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
 // Pop one 20 ms block and play it. 8 kHz in, 48 kHz out, linearly interpolated
 // so the amplifier sees the rate it actually supports.
 static void rtPlayBlock() {
-  static int16_t src[161];
+  static int16_t src[481];
   // 7.7 KB, and internal RAM is exactly what the TLS handshake is short of.
   static int32_t *frame = nullptr;
   if (!frame) {
@@ -1791,18 +1823,19 @@ static void rtPlayBlock() {
   }
 
   size_t have = rtAvailable();
-  if (have < 161) return;
+  if (have < 481) return;
 
-  for (size_t i = 0; i < 161; i++) {
+  for (size_t i = 0; i < 481; i++) {
     src[i] = gRtRing[(gRtTail + i) % RT_RING];
   }
-  gRtTail = (gRtTail + 160) % RT_RING;
+  gRtTail = (gRtTail + 480) % RT_RING;
 
+  // 480 samples at 24 kHz -> 960 frames at 48 kHz, 20 ms either way.
   size_t f = 0;
-  for (size_t i = 0; i < 160; i++) {
+  for (size_t i = 0; i < 480; i++) {
     int32_t a = src[i], b = src[i + 1];
-    for (int k = 0; k < 6; k++) {
-      int32_t v = a + ((b - a) * k) / 6;
+    for (int k = 0; k < 2; k++) {
+      int32_t v = a + ((b - a) * k) / 2;
       v = (int32_t)(v * TTS_VOLUME);
       if (v > 32767) v = 32767;
       if (v < -32768) v = -32768;
@@ -1812,7 +1845,7 @@ static void rtPlayBlock() {
     }
   }
   Speaker.write((uint8_t *)frame, f * 2 * sizeof(int32_t));
-  gRtPlayed += 160;
+  gRtPlayed += 480;
 }
 
 static bool rtSendJson(JsonDocument &doc) {
@@ -1929,7 +1962,8 @@ static void realtimeSession() {
     turn["silence_duration_ms"] = 400;
 
     JsonObject out = audio["output"].to<JsonObject>();
-    out["format"]["type"] = "audio/pcmu";
+    out["format"]["type"] = "audio/pcm";
+    out["format"]["rate"] = RT_RX_RATE;
     out["voice"] = REALTIME_VOICE;
     rtSendJson(cfg);
   }
@@ -1963,7 +1997,7 @@ static void realtimeSession() {
 
     // Draining the ring takes priority: a gap here is audible, a late
     // microphone chunk is not.
-    if (rtAvailable() >= 161) {
+    if (rtAvailable() >= 481) {
       rtPlayBlock();
       lastVoice = millis();
       if (gRtTranscript.length() && gRtTranscript != shown) {
@@ -2024,7 +2058,7 @@ static void realtimeSession() {
 
     // Require audio: the server's VAD can hear the tail of the wake word and
     // emit an empty turn, which would otherwise close the session instantly.
-    if (gRtResponseDone && gRtTurnRx > 0 && rtAvailable() < 161) {
+    if (gRtResponseDone && gRtTurnRx > 0 && rtAvailable() < 481) {
       gRtResponseDone = false;
 
       String turn = gRtTurnText;
@@ -2063,8 +2097,8 @@ static void realtimeSession() {
        "played=%.1f s dropped=%lu",
        (unsigned long)(millis() - start), (unsigned long)gRtEvents,
        (unsigned long)gRtTxBytes, gRtTxBytes / 8000.0f,
-       (unsigned long)gRtRxBytes, gRtRxBytes / 8000.0f,
-       gRtPlayed / 8000.0f, (unsigned long)gRtDropped);
+       (unsigned long)gRtRxBytes, gRtRxBytes / 2.0f / RT_RX_RATE,
+       gRtPlayed / (float)RT_RX_RATE, (unsigned long)gRtDropped);
   if (gRtTranscript.length()) logf("said: %s", gRtTranscript.c_str());
   if (gRtTranscript.length()) emitEvent("answer", "text", gRtTranscript.c_str());
 }
