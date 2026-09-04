@@ -1196,7 +1196,7 @@ private:
   size_t _len = 0;
 };
 
-static void playPcm(const uint8_t *pcm, size_t bytes) {
+static void playPcm(const uint8_t *pcm, size_t bytes, float gain) {
   const int16_t *src = (const int16_t *)pcm;
   size_t total = bytes / sizeof(int16_t);
   static int32_t frame[256 * 2];
@@ -1205,7 +1205,7 @@ static void playPcm(const uint8_t *pcm, size_t bytes) {
   while (i < total) {
     size_t n = 0;
     while (n < 254 && i < total) {
-      int32_t v = (int32_t)(src[i++] * TTS_VOLUME);
+      int32_t v = (int32_t)(src[i++] * gain);
       if (v > 32767) v = 32767;
       if (v < -32768) v = -32768;
       // Each 24 kHz sample becomes two 48 kHz frames, both slots identical.
@@ -1286,11 +1286,27 @@ static bool speak(const char *text) {
     logf("tts returned no audio");
     return false;
   }
-  logf("tts %u KB in %lu ms, playing %.1f s",
-       (unsigned)(got / 1024), (unsigned long)(millis() - t0),
-       got / 2.0f / TTS_SAMPLE_RATE);
+  // TTS rarely comes back near full scale, and at 3V3 the amplifier has ~8 dB
+  // less output than it would at 5V, so use the headroom rather than waste it.
+  int32_t peak = 0;
+  const int16_t *samples = (const int16_t *)gTtsBuf;
+  for (size_t i = 0; i < got / 2; i++) {
+    int32_t mag = samples[i] < 0 ? -(int32_t)samples[i] : (int32_t)samples[i];
+    if (mag > peak) peak = mag;
+  }
 
-  playPcm(gTtsBuf, got);
+  float gain = TTS_VOLUME;
+  if (peak > 0) {
+    float boost = 31000.0f / (float)peak;
+    if (boost > TTS_MAX_BOOST) boost = TTS_MAX_BOOST;
+    if (boost > 1.0f) gain = boost;
+  }
+
+  logf("tts %u KB in %lu ms, playing %.1f s (peak %d, gain x%.2f)",
+       (unsigned)(got / 1024), (unsigned long)(millis() - t0),
+       got / 2.0f / TTS_SAMPLE_RATE, (int)peak, gain);
+
+  playPcm(gTtsBuf, got, gain);
   return true;
 }
 #endif  // TTS_ENABLED

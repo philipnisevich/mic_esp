@@ -61,7 +61,8 @@
 #define TTS_MODEL   "tts-1"
 #define TTS_VOICE   "alloy"   // alloy, echo, fable, onyx, nova, shimmer
 #define TTS_SAMPLE_RATE 24000 // fixed by the API's pcm format
-#define TTS_VOLUME  0.85f     // 0.0-1.0, applied in software before I2S
+#define TTS_VOLUME  1.0f      // floor gain; normalisation raises quiet clips
+#define TTS_MAX_BOOST 4.0f    // cap on that normalisation
 #define TTS_MAX_SECONDS 25    // buffer cap; ~48 KB per second in PSRAM
 
 // ------------------------------------------------------------------ oled ---
