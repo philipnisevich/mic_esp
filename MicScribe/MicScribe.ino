@@ -1640,6 +1640,14 @@ static volatile bool gRtResponseDone = false;  // the model finished a turn
 static String gRtTurnText;        // transcript of just the current turn
 static volatile uint32_t gRtTurnRx = 0;  // audio bytes in the current turn
 
+// What the model signalled about this turn, via a forced tool call.
+static const uint8_t RT_INTENT_UNKNOWN = 0;
+static const uint8_t RT_INTENT_END     = 1;
+static const uint8_t RT_INTENT_STAY    = 2;
+static volatile uint8_t gRtIntent = RT_INTENT_UNKNOWN;
+static volatile bool gRtStopRequested = false;  // you said stop / shut up / etc.
+static String gRtCallId;
+
 static inline size_t rtAvailable() {
   size_t h = gRtHead, t = gRtTail;
   return (h >= t) ? (h - t) : (RT_RING - t + h);
@@ -1665,12 +1673,45 @@ static inline uint8_t pcmToUlaw(int16_t pcm) {
   return (uint8_t)~(sign | (exponent << 4) | mantissa);
 }
 
+// "stop", "shut up", "never mind" and friends end the session. Matched only
+// against a short whole utterance, so "when does the bus stop running" is safe.
+static bool isStopPhrase(const String &raw) {
+  static const char *PHRASES[] = {
+    "stop", "stop it", "shut up", "be quiet", "quiet",
+    "turn off", "turn it off", "shut down", "shut off",
+    "never mind", "nevermind", "cancel", "forget it",
+    "that is all", "thats all", "that's all", "we are done", "were done",
+    "goodbye", "good bye", "bye", "bye bye", "exit", "end",
+  };
+
+  String t;
+  for (int i = 0; i < (int)raw.length(); i++) {
+    char c = raw[i];
+    if (isalnum((unsigned char)c) || c == ' ' || c == '\'') t += (char)tolower((unsigned char)c);
+    else if (c == ',' || c == '.' || c == '!' || c == '?') t += ' ';
+  }
+  t.trim();
+  while (t.indexOf("  ") >= 0) t.replace("  ", " ");
+  if (t.length() == 0 || t.length() > 24) return false;  // long sentences are not commands
+
+  for (size_t i = 0; i < sizeof(PHRASES) / sizeof(PHRASES[0]); i++) {
+    if (t == PHRASES[i]) return true;
+    String withPlease = String(PHRASES[i]) + " please";
+    if (t == withPlease) return true;
+  }
+  return false;
+}
+
 static void rtOnMessage(websockets::WebsocketsMessage msg) {
   // Only two fields matter on the hot path, and audio frames are several KB,
   // so filter rather than materialise the whole event.
   JsonDocument filter;
   filter["type"] = true;
   filter["delta"] = true;
+  filter["transcript"] = true;
+  filter["item"]["type"] = true;
+  filter["item"]["name"] = true;
+  filter["item"]["call_id"] = true;
   filter["error"]["message"] = true;
 
   JsonDocument doc;
@@ -1709,6 +1750,23 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
     gRtTurnText = "";
     gRtTurnRx = 0;
     gRtResponseDone = false;
+    gRtIntent = RT_INTENT_UNKNOWN;
+
+  } else if (!strcmp(type, "response.output_item.done")) {
+    const char *itemType = doc["item"]["type"] | "";
+    if (!strcmp(itemType, "function_call")) {
+      const char *name = doc["item"]["name"] | "";
+      gRtCallId = (const char *)(doc["item"]["call_id"] | "");
+      if (!strcmp(name, "end_conversation")) gRtIntent = RT_INTENT_END;
+      else if (!strcmp(name, "stay_open"))   gRtIntent = RT_INTENT_STAY;
+    }
+
+  } else if (!strcmp(type, "conversation.item.input_audio_transcription.completed")) {
+    String heard = (const char *)(doc["transcript"] | "");
+    if (isStopPhrase(heard)) {
+      logf("heard \"%s\" - ending", heard.c_str());
+      gRtStopRequested = true;
+    }
 
   } else if (!strcmp(type, "response.done")) {
     gRtResponseDone = true;
@@ -1777,6 +1835,9 @@ static void realtimeSession() {
   gRtResponseDone = false;
   gRtTurnText = "";
   gRtTurnRx = 0;
+  gRtIntent = RT_INTENT_UNKNOWN;
+  gRtStopRequested = false;
+  gRtCallId = "";
 
   setStatus(STATUS_WORKING);
   oledShow("Nova", "Connecting...");
@@ -1850,9 +1911,16 @@ static void realtimeSession() {
     sess["instructions"] = REALTIME_INSTRUCTIONS;
     sess["output_modalities"].to<JsonArray>().add("audio");
 
+    // No tools here. Registering them with tool_choice "required" makes the
+    // model emit the tool call INSTEAD of speech - measured against the live
+    // API: 0 bytes of audio with "required", 96 KB with "auto" but then it
+    // never calls the tool. Turn intent is judged locally instead.
+
     JsonObject audio = sess["audio"].to<JsonObject>();
     JsonObject in = audio["input"].to<JsonObject>();
     in["format"]["type"] = "audio/pcmu";
+    // Transcribing your side too, so "stop" and "shut up" can be recognised.
+    in["transcription"]["model"] = "whisper-1";
     JsonObject turn = in["turn_detection"].to<JsonObject>();
     turn["type"] = "server_vad";
     turn["silence_duration_ms"] = 400;
@@ -1946,23 +2014,37 @@ static void realtimeSession() {
     // A finished turn with the ring drained means the reply has been spoken.
     // End there unless it asked a question, in which case stay open just long
     // enough for an answer.
+    if (gRtStopRequested) {
+      logf("stop requested, closing");
+      break;
+    }
+
     // Require audio: the server's VAD can hear the tail of the wake word and
     // emit an empty turn, which would otherwise close the session instantly.
     if (gRtResponseDone && gRtTurnRx > 0 && rtAvailable() < 161) {
       gRtResponseDone = false;
+
       String turn = gRtTurnText;
       turn.trim();
-      if (turn.endsWith("?")) {
-        logf("asked a question, waiting for your reply");
+
+      // A lookup answers in one short sentence; an explanation runs longer and
+      // invites a follow-up. Measured on real replies: "Chelsea's next match is
+      // on Saturday against Liverpool." is 53 characters, a weather answer 79,
+      // while an explanation of a concept runs well past 150.
+      bool stay = turn.endsWith("?") || turn.length() >= REALTIME_OPEN_CHARS;
+
+      if (stay) {
+        logf("open topic (%d chars), listening %lu ms for a follow-up",
+             (int)turn.length(), (unsigned long)REALTIME_FOLLOWUP_MS);
         awaitingReply = true;
         lastVoice = millis();
       } else {
-        logf("reply finished, closing");
+        logf("lookup answered (%d chars), closing", (int)turn.length());
         break;
       }
     }
 
-    uint32_t idleLimit = awaitingReply ? REALTIME_REPLY_MS : REALTIME_IDLE_MS;
+    uint32_t idleLimit = awaitingReply ? REALTIME_FOLLOWUP_MS : REALTIME_IDLE_MS;
     if ((millis() - lastVoice) > idleLimit) {
       logf("realtime idle, closing");
       break;

@@ -124,13 +124,19 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 
 #define REALTIME_INSTRUCTIONS \
   "You are Nova, a voice assistant on a small device. Keep every reply to one " \
-  "short spoken sentence. Be direct and warm. Never spell out symbols or " \
-  "markdown. If you do not know, say so briefly."
+  "or two short spoken sentences. Be direct and warm. Never spell out symbols " \
+  "or markdown. If you do not know, say so briefly. Answer a simple lookup, " \
+  "such as the time, the weather, a score or a price, in one short sentence. " \
+  "Explain a concept or give advice in two sentences so the answer stands on " \
+  "its own."
 
 // A reply that is not a question ends the session immediately. These only
 // apply while waiting for you to speak.
 #define REALTIME_IDLE_MS       12000  // no speech at all after connecting
-#define REALTIME_REPLY_MS       8000  // it asked something and is waiting
+#define REALTIME_FOLLOWUP_MS    3000  // open topic: how long to wait for you
+// Replies at least this long read as explanations rather than lookups, and
+// leave the session open for a follow-up.
+#define REALTIME_OPEN_CHARS      110
 #define REALTIME_MAX_MS       120000  // hard ceiling on one session
 
 // ------------------------------------------------------------------ oled ---
