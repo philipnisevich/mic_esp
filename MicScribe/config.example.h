@@ -133,6 +133,10 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 // A reply that is not a question ends the session immediately. These only
 // apply while waiting for you to speak.
 #define REALTIME_IDLE_MS       12000  // no speech at all after connecting
+// Audio buffered before playback starts. Too little and the first second
+// underruns; too much and the reply feels delayed.
+#define REALTIME_PREBUFFER_MS    400
+
 #define REALTIME_FOLLOWUP_MS    3000  // open topic: how long to wait for you
 // Replies at least this long read as explanations rather than lookups, and
 // leave the session open for a follow-up.

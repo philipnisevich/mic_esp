@@ -1641,6 +1641,11 @@ static WebsocketsClient gWs;
 // the reply comes back at full rate.
 static const uint32_t RT_RX_RATE = 24000;
 
+// Playback used to start after a single 20 ms block, so the DMA drained faster
+// than the socket filled it and the first second glitched. Wait for a cushion
+// before the first block of a turn; once running, the stream stays ahead.
+static const size_t RT_PREBUFFER = (RT_RX_RATE * REALTIME_PREBUFFER_MS) / 1000;
+
 // Audio arrives faster than it plays, so the ring holds a whole reply. 30 s at
 // 24 kHz is 1.44 MB of PSRAM.
 static const size_t RT_RING = 24000 * 30;
@@ -1848,6 +1853,34 @@ static void rtPlayBlock() {
   gRtPlayed += 480;
 }
 
+// Playback runs in its own task on the other core. Feeding I2S from the socket
+// loop meant a burst of large 24 kHz chunks - JSON parse plus base64 decode -
+// could block the writer for longer than the ~30 ms the DMA holds, draining it
+// mid-word. A prebuffer cannot fix that: the stall is downstream of the ring.
+static TaskHandle_t gRtPlayTask = nullptr;
+static volatile bool gRtPlayRun = false;
+
+static void rtPlayTaskFn(void *arg) {
+  bool playing = false;
+  while (gRtPlayRun) {
+    size_t avail = rtAvailable();
+    if (!playing && avail >= RT_PREBUFFER) playing = true;
+    if (playing) {
+      if (avail >= 481) {
+        rtPlayBlock();      // blocks on DMA, which paces this loop
+        continue;
+      }
+      // Drop the sub-block remainder (under 20 ms) rather than let it prepend
+      // itself to the next reply.
+      gRtTail = gRtHead;
+      playing = false;      // run drained; next turn buffers again
+    }
+    vTaskDelay(1);
+  }
+  gRtPlayTask = nullptr;
+  vTaskDelete(NULL);
+}
+
 static bool rtSendJson(JsonDocument &doc) {
   String out;
   serializeJson(doc, out);
@@ -1978,6 +2011,11 @@ static void realtimeSession() {
     rtSendJson(clr);
   }
 
+  // Pinned to core 0: ESP-SR is paused for the session, so that core is idle,
+  // and this keeps the writer off the core running the socket.
+  gRtPlayRun = true;
+  xTaskCreatePinnedToCore(rtPlayTaskFn, "rt_play", 4096, nullptr, 6, &gRtPlayTask, 0);
+
   oledShow("Nova", "Listening...");
   setStatus(STATUS_RECORDING);
   emitEvent("state", "state", "realtime");
@@ -1995,15 +2033,20 @@ static void realtimeSession() {
   while (gWs.available() && (millis() - start) < REALTIME_MAX_MS) {
     gWs.poll();
 
-    // Draining the ring takes priority: a gap here is audible, a late
-    // microphone chunk is not.
+    // Playback is the writer task's job now. While anything is queued or
+    // playing, skip the microphone: there is no echo cancellation, so the
+    // server would otherwise hear our own speaker.
+    // Match the player's block size, not zero. It consumes 480 samples at a
+    // time and needs 481, so 1-480 always remain - testing for > 0 meant this
+    // branch never exited, the turn decision was never reached, and lastVoice
+    // was refreshed every pass so the idle timeout could not fire either.
     if (rtAvailable() >= 481) {
-      rtPlayBlock();
       lastVoice = millis();
       if (gRtTranscript.length() && gRtTranscript != shown) {
         shown = gRtTranscript;
         oledShow("Nova", shown.c_str());
       }
+      delay(2);
       continue;
     }
 
@@ -2091,6 +2134,12 @@ static void realtimeSession() {
       break;
     }
   }
+
+  // Let the tail of the reply finish before tearing the writer down.
+  uint32_t drainUntil = millis() + 3000;
+  while (rtAvailable() >= 481 && millis() < drainUntil) delay(10);
+  gRtPlayRun = false;
+  while (gRtPlayTask != nullptr) delay(5);
 
   gWs.close();
   logf("realtime ended after %lu ms: events=%lu tx=%lu B (%.1f s) rx=%lu B (%.1f s) "
