@@ -7,7 +7,7 @@ set -euo pipefail
 # which pushes the audio buffer into internal RAM and starves the TLS stack.
 # CDCOnBoot=cdc is essential too: without it Serial maps to UART0 on GPIO43/44
 # instead of the native USB port, and nothing reaches the host.
-FQBN="esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,CDCOnBoot=cdc"
+FQBN="esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=esp_sr_16,FlashSize=16M,CDCOnBoot=cdc"
 SKETCH="$(cd "$(dirname "$0")" && pwd)/MicScribe"
 
 if [ ! -f "$SKETCH/config.h" ]; then

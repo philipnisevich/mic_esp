@@ -82,10 +82,22 @@ def reset_board(ser):
     high restarts the board into normal run mode.
     """
     try:
-        ser.setDTR(False)   # GPIO0 high -> run, not download mode
-        ser.setRTS(True)    # EN low  -> held in reset
+        # The ESP32-S3's built-in USB Serial/JTAG has no physical DTR/RTS lines;
+        # it decodes a specific sequence of the two into a reset instead. This
+        # is the order esptool uses, and the classic EN/GPIO0 wiggle does
+        # nothing on these parts.
+        ser.setRTS(False)
+        ser.setDTR(False)
         time.sleep(0.1)
-        ser.setRTS(False)   # EN high -> boot
+        ser.setDTR(True)
+        ser.setRTS(False)
+        time.sleep(0.1)
+        ser.setRTS(True)
+        ser.setDTR(False)
+        ser.setRTS(True)
+        time.sleep(0.1)
+        ser.setDTR(False)
+        ser.setRTS(False)
         time.sleep(0.05)
         ser.reset_input_buffer()
     except (OSError, serial.SerialException) as exc:
@@ -119,6 +131,18 @@ def handle_line(line, args):
             copy_to_clipboard(text)
         if args.type:
             type_text(text)
+    elif kind == "answer":
+        # The model's reply. Printed, not typed - --type stays bound to
+        # transcripts so dictation keeps working as before.
+        mark = "\u2726" if not event.get("research") else "\u2295"
+        print(f"\033[96m{mark}\033[0m {event.get('text', '')}")
+        if args.verbose and event.get("model"):
+            print(f"\033[90m   via {event['model']}\033[0m")
+    elif kind == "noise":
+        # Non-speech: a false wake, or a stray tap. Never type or copy this.
+        if args.verbose:
+            detail = event.get("text") or event.get("reason") or ""
+            print(f"\033[90m· noise discarded {detail}\033[0m")
     elif kind == "error":
         print(f"\033[91m! {event.get('error')}\033[0m", file=sys.stderr)
     elif kind == "state" and args.verbose:
@@ -151,6 +175,15 @@ def main():
     while True:
         try:
             with serial.Serial(port, args.baud, timeout=1) as ser:
+                # The S3's USB-Serial/JTAG gates its TX on the host looking
+                # "connected". Opening a /dev/cu.* device does not necessarily
+                # assert DTR, and without it the firmware's output is discarded
+                # before it ever reaches us.
+                try:
+                    ser.dtr = True
+                    ser.rts = False
+                except (OSError, serial.SerialException):
+                    pass
                 if args.reset:
                     reset_board(ser)
                 while True:
