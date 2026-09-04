@@ -1784,10 +1784,6 @@ static void realtimeSession() {
   // setInsecure() is a no-op on ESP32 in this library: upgradeToSecuredConnection()
   // only applies setInsecure on ESP8266, so without a CA the WiFiClientSecure it
   // creates has no trust anchor and the handshake fails before the upgrade.
-  gWs.setCACert(OPENAI_ROOT_CA);
-  gWs.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
-  gWs.onMessage(rtOnMessage);
-
   logf("heap before connect: free=%u largest=%u",
        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
@@ -1799,16 +1795,44 @@ static void realtimeSession() {
   String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
   uint32_t t0 = millis();
 
+  // Configure exactly once for the lifetime of the program. addHeader() appends
+  // to a vector that WebsocketsClient::operator= does not assign, so neither a
+  // second call nor `gWs = WebsocketsClient()` clears it - headers accumulate
+  // across attempts and across sessions. OpenAI answers a duplicated
+  // Authorization header with 400 Bad Request, confirmed by replaying both
+  // handshakes against the live endpoint, which is why this worked for the
+  // first few sessions after boot and then failed until reboot.
+  static bool wsConfigured = false;
+  if (!wsConfigured) {
+    gWs.setCACert(OPENAI_ROOT_CA);
+    gWs.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+    gWs.onMessage(rtOnMessage);
+    wsConfigured = true;
+  }
+
   bool connected = false;
   for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
     connected = gWs.connect(url);
     if (!connected) {
       logf("connect attempt %d failed (largest block %u)",
            attempt, (unsigned)ESP.getMaxAllocHeap());
-      delay(400);
+      delay(500);
     }
   }
   if (!connected) {
+    // Only probe on total failure, so the extra session does not fragment the
+    // heap on the common path. It separates transport from the upgrade.
+    NetworkClientSecure probe;
+    probe.setCACert(OPENAI_ROOT_CA);
+    probe.setHandshakeTimeout(15);
+    if (probe.connect("api.openai.com", 443)) {
+      logf("but plain TLS succeeded - the websocket upgrade is what failed");
+      probe.stop();
+    } else {
+      char err[128] = {0};
+      int code = probe.lastError(err, sizeof(err));
+      logf("plain TLS also failed (%d) %s - transport problem", code, err);
+    }
     logf("realtime connect failed after 3 attempts");
     oledShow("Error", "Could not connect");
     setStatus(STATUS_ERROR);
