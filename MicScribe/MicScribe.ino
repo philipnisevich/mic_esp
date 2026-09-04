@@ -1636,6 +1636,9 @@ static uint32_t gRtTxBytes = 0;   // mu-law sent from the microphone
 static uint32_t gRtPlayed = 0;    // samples actually written to I2S
 static uint32_t gRtEvents = 0;    // websocket messages seen
 static uint32_t gRtDropped = 0;   // ring overruns
+static volatile bool gRtResponseDone = false;  // the model finished a turn
+static String gRtTurnText;        // transcript of just the current turn
+static volatile uint32_t gRtTurnRx = 0;  // audio bytes in the current turn
 
 static inline size_t rtAvailable() {
   size_t h = gRtHead, t = gRtTail;
@@ -1688,6 +1691,7 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
       return;
     }
     gRtRxBytes += outLen;
+    gRtTurnRx += outLen;
     for (size_t i = 0; i < outLen; i++) {
       size_t next = (gRtHead + 1) % RT_RING;
       if (next == gRtTail) { gRtDropped++; break; }  // ring full
@@ -1697,7 +1701,17 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
     gRtSawAudio = true;
 
   } else if (!strcmp(type, "response.output_audio_transcript.delta")) {
-    gRtTranscript += (const char *)(doc["delta"] | "");
+    const char *d = doc["delta"] | "";
+    gRtTranscript += d;
+    gRtTurnText += d;
+
+  } else if (!strcmp(type, "response.created")) {
+    gRtTurnText = "";
+    gRtTurnRx = 0;
+    gRtResponseDone = false;
+
+  } else if (!strcmp(type, "response.done")) {
+    gRtResponseDone = true;
 
   } else if (!strcmp(type, "error")) {
     logf("realtime error: %s", (const char *)(doc["error"]["message"] | "unknown"));
@@ -1760,6 +1774,9 @@ static void realtimeSession() {
   gRtTranscript = "";
   gRtSawAudio = false;
   gRtRxBytes = gRtTxBytes = gRtPlayed = gRtEvents = gRtDropped = 0;
+  gRtResponseDone = false;
+  gRtTurnText = "";
+  gRtTurnRx = 0;
 
   setStatus(STATUS_WORKING);
   oledShow("Nova", "Connecting...");
@@ -1822,6 +1839,16 @@ static void realtimeSession() {
     rtSendJson(cfg);
   }
 
+  // The wake phrase is still in the I2S buffer at this point. Throw it away,
+  // both locally and server-side, or it gets treated as the first utterance.
+  {
+    static int32_t flush[I2S_CHUNK_FRAMES];
+    for (int i = 0; i < 12; i++) I2S.readBytes((char *)flush, sizeof(flush));
+    JsonDocument clr;
+    clr["type"] = "input_audio_buffer.clear";
+    rtSendJson(clr);
+  }
+
   oledShow("Nova", "Listening...");
   setStatus(STATUS_RECORDING);
   emitEvent("state", "state", "realtime");
@@ -1833,6 +1860,7 @@ static void realtimeSession() {
 
   uint32_t start = millis();
   uint32_t lastVoice = millis();
+  bool awaitingReply = false;
   String shown;
 
   while (gWs.available() && (millis() - start) < REALTIME_MAX_MS) {
@@ -1873,7 +1901,10 @@ static void realtimeSession() {
 
       if (ulawLen < sizeof(ulaw)) ulaw[ulawLen++] = pcmToUlaw((int16_t)v);
     }
-    if (peak > SPEECH_MIN_PEAK) lastVoice = millis();
+    if (peak > SPEECH_MIN_PEAK) {
+      lastVoice = millis();
+      awaitingReply = false;  // you answered; the next turn decides afresh
+    }
 
     if (ulawLen >= 800) {
       size_t n = 0;
@@ -1888,7 +1919,27 @@ static void realtimeSession() {
       ulawLen = 0;
     }
 
-    if ((millis() - lastVoice) > REALTIME_IDLE_MS) {
+    // A finished turn with the ring drained means the reply has been spoken.
+    // End there unless it asked a question, in which case stay open just long
+    // enough for an answer.
+    // Require audio: the server's VAD can hear the tail of the wake word and
+    // emit an empty turn, which would otherwise close the session instantly.
+    if (gRtResponseDone && gRtTurnRx > 0 && rtAvailable() < 161) {
+      gRtResponseDone = false;
+      String turn = gRtTurnText;
+      turn.trim();
+      if (turn.endsWith("?")) {
+        logf("asked a question, waiting for your reply");
+        awaitingReply = true;
+        lastVoice = millis();
+      } else {
+        logf("reply finished, closing");
+        break;
+      }
+    }
+
+    uint32_t idleLimit = awaitingReply ? REALTIME_REPLY_MS : REALTIME_IDLE_MS;
+    if ((millis() - lastVoice) > idleLimit) {
       logf("realtime idle, closing");
       break;
     }

@@ -127,7 +127,10 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
   "short spoken sentence. Be direct and warm. Never spell out symbols or " \
   "markdown. If you do not know, say so briefly."
 
-#define REALTIME_IDLE_MS       20000  // end the session after this much quiet
+// A reply that is not a question ends the session immediately. These only
+// apply while waiting for you to speak.
+#define REALTIME_IDLE_MS       12000  // no speech at all after connecting
+#define REALTIME_REPLY_MS       8000  // it asked something and is waiting
 #define REALTIME_MAX_MS       120000  // hard ceiling on one session
 
 // ------------------------------------------------------------------ oled ---
