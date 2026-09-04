@@ -175,6 +175,15 @@ def main():
     while True:
         try:
             with serial.Serial(port, args.baud, timeout=1) as ser:
+                # The S3's USB-Serial/JTAG gates its TX on the host looking
+                # "connected". Opening a /dev/cu.* device does not necessarily
+                # assert DTR, and without it the firmware's output is discarded
+                # before it ever reaches us.
+                try:
+                    ser.dtr = True
+                    ser.rts = False
+                except (OSError, serial.SerialException):
+                    pass
                 if args.reset:
                     reset_board(ser)
                 while True:

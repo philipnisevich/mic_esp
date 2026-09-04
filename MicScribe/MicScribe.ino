@@ -46,6 +46,13 @@ static const int PIN_I2S_DIN  = 6;
 // button on most S3 dev boards, so this works with no extra hardware.
 static const int PIN_BUTTON = 0;
 
+// MAX98357A I2S amplifier (output). Uses the S3's second I2S controller, so it
+// runs alongside the microphone rather than competing with it.
+//   VIN -> 5V, GND -> GND, GAIN and SD left floating
+static const int PIN_AMP_BCLK = 15;
+static const int PIN_AMP_LRC  = 16;
+static const int PIN_AMP_DIN  = 7;
+
 // SSD1306 OLED over I2C. These are the S3's default Wire pins.
 //   VCC -> 3V3, GND -> GND, SCL -> GPIO9, SDA -> GPIO8
 static const int PIN_I2C_SDA = 8;
@@ -99,7 +106,11 @@ static const uint32_t MAX_SECONDS_PSRAM    = 20;
 static const uint32_t MAX_SECONDS_NO_PSRAM = 3;
 
 // ---------------------------------------------------------------- state ----
-static I2SClass I2S;
+static I2SClass I2S;       // microphone, RX
+static I2SClass Speaker;   // MAX98357A, TX
+static bool     gSpeakerReady = false;
+static uint8_t *gTtsBuf = nullptr;
+static size_t   gTtsCap = 0;
 
 static uint8_t *gBuffer     = nullptr;  // [WAV header][PCM ...]
 static size_t   gCapacity   = 0;        // total bytes allocated
@@ -472,15 +483,20 @@ static void writeWavHeader(uint8_t *dst, size_t pcmBytes) {
 }
 
 // ------------------------------------------------------------- wake word ---
-// Phonemes generated with the core's own tool, so they match what MultiNet
-// was trained to expect:
-//   python3 libraries/ESP_SR/tools/gen_sr_commands.py "Hey Nova,Hi Nova,Okay Nova"
-// All three map to command 0 - any of them starts a take. Bare "Nova" is
-// deliberately left out: one short syllable false-accepts constantly.
+// The core generates phonemes on-device (flite_g2p) from plain text, so
+// sr_cmd_t is just {command_id, phrase}. All three map to command 0 - any of
+// them starts a take. Bare "Nova" is deliberately left out: one short
+// syllable false-accepts constantly.
 static const sr_cmd_t SR_COMMANDS[] = {
-  {0, "Hey Nova",  "hd NbVc"},
-  {0, "Hi Nova",   "hi NbVc"},
-  {0, "Okay Nova", "bKd NbVc"},
+  {0, "Hey Nova"},
+  {0, "Hi Nova"},
+  {0, "Okay Nova"},
+  // MultiNet7's FST builder panics (StoreProhibited, index -1) when the list
+  // resolves to a single command id. Every working example in the core ships
+  // several, so keep at least one more distinct id present. These are ignored
+  // by srEvent(); they exist to keep the grammar well-formed.
+  {1, "Cancel that"},
+  {2, "Never mind"},
 };
 
 // ------------------------------------------------------------- recording ---
@@ -648,7 +664,7 @@ static esp_err_t srFill(void *arg, void *out, size_t len, size_t *bytes_read, ui
 static void srEvent(void *arg, sr_event_t event, int command_id, int phrase_id) {
   switch (event) {
     case SR_EVENT_COMMAND:
-      if (gState == ST_LISTENING) {
+      if (command_id == 0 && gState == ST_LISTENING) {
         gWakeRequested = true;
       }
       // MultiNet stops detecting after a hit until the mode is set again, so
@@ -953,6 +969,43 @@ static bool isRefusal(const String &answer) {
   return false;
 }
 
+// The search model appends citations like "([skysports.com](https://...))"
+// however firmly the prompt forbids them. They wreck a 128x64 screen and, far
+// worse, get read aloud as a URL. Reduce "[label](url)" to "label" and drop
+// bare URLs, before the answer reaches either the display or the speaker.
+static void stripLinks(String &text) {
+  String out;
+  out.reserve(text.length());
+
+  for (int i = 0; i < (int)text.length();) {
+    if (text[i] == '[') {
+      int close = text.indexOf(']', i);
+      int open = (close >= 0 && close + 1 < (int)text.length() && text[close + 1] == '(')
+                   ? close + 1 : -1;
+      if (open > 0) {
+        int end = text.indexOf(')', open);
+        if (end > 0) {
+          out += text.substring(i + 1, close);  // keep the label
+          i = end + 1;
+          continue;
+        }
+      }
+    }
+    if (text.startsWith("http://", i) || text.startsWith("https://", i)) {
+      while (i < (int)text.length() && text[i] != ' ' && text[i] != ')' && text[i] != '\n') i++;
+      continue;
+    }
+    out += text[i++];
+  }
+
+  // Citations usually leave "(...)" or " ." behind once the link is gone.
+  out.replace("()", "");
+  out.replace(" .", ".");
+  out.replace("..", ".");
+  out.trim();
+  text = out;
+}
+
 static void emitAnswer(const char *text, const char *model, bool researched) {
   JsonDocument doc;
   doc["type"] = "answer";
@@ -1064,6 +1117,155 @@ static bool askOpenAI(const char *question, String &answer, bool research) {
   return true;
 }
 
+// ------------------------------------------------------------------ tts ----
+#if TTS_ENABLED
+static bool speakerBegin() {
+  Speaker.setPins(PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, -1 /* no din */, -1);
+  // Stereo with both slots carrying the same sample. The MAX98357A averages
+  // L and R when SD is floating, so sending true mono would halve the level.
+  if (!Speaker.begin(I2S_MODE_STD, TTS_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
+    logf("speaker I2S init failed - is another peripheral using bclk=%d ws=%d?",
+         PIN_AMP_BCLK, PIN_AMP_LRC);
+    return false;
+  }
+  gTtsCap = (size_t)TTS_SAMPLE_RATE * 2 * TTS_MAX_SECONDS;
+  gTtsBuf = (uint8_t *)ps_malloc(gTtsCap);
+  if (!gTtsBuf) {
+    gTtsCap = 0;
+    logf("no PSRAM for the tts buffer");
+    return false;
+  }
+  gSpeakerReady = true;
+  logf("speaker ok: bclk=%d lrc=%d din=%d @ %d Hz, %u KB buffer",
+       PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, TTS_SAMPLE_RATE,
+       (unsigned)(gTtsCap / 1024));
+  return true;
+}
+
+// HTTPClient::writeToStream() handles both content-length and chunked bodies
+// and stops exactly at the end. Reading getStreamPtr() directly does neither,
+// which is how a 238 KB clip turned into 714 KB of over-read.
+class BufferSink : public Stream {
+public:
+  BufferSink(uint8_t *buf, size_t cap) : _buf(buf), _cap(cap) {}
+  size_t write(uint8_t b) override {
+    if (_len >= _cap) return 0;
+    _buf[_len++] = b;
+    return 1;
+  }
+  size_t write(const uint8_t *data, size_t len) override {
+    size_t n = len;
+    if (_len + n > _cap) n = _cap - _len;
+    if (n) memcpy(_buf + _len, data, n);
+    _len += n;
+    return n;
+  }
+  size_t length() const { return _len; }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+private:
+  uint8_t *_buf;
+  size_t _cap;
+  size_t _len = 0;
+};
+
+static void playPcm(const uint8_t *pcm, size_t bytes) {
+  const int16_t *src = (const int16_t *)pcm;
+  size_t total = bytes / sizeof(int16_t);
+  static int16_t frame[256 * 2];
+
+  size_t i = 0;
+  while (i < total) {
+    size_t n = 0;
+    while (n < 256 && i < total) {
+      int32_t v = (int32_t)(src[i++] * TTS_VOLUME);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      frame[n * 2] = (int16_t)v;
+      frame[n * 2 + 1] = (int16_t)v;
+      n++;
+    }
+    // Blocking write: the DMA queue paces this loop for us.
+    Speaker.write((uint8_t *)frame, n * 2 * sizeof(int16_t));
+  }
+}
+
+// A plain sine straight to the amp. Independent of WiFi, OpenAI and the whole
+// TTS path, so if this is silent the problem is wiring, power or the SD pin.
+static void playTone(uint16_t freq, uint16_t ms) {
+  if (!gSpeakerReady) return;
+  const size_t total = (size_t)TTS_SAMPLE_RATE * ms / 1000;
+  static int16_t frame[256 * 2];
+  size_t i = 0;
+  while (i < total) {
+    size_t c = 0;
+    while (c < 256 && i < total) {
+      float t = (float)i / (float)TTS_SAMPLE_RATE;
+      int32_t v = (int32_t)(sinf(2.0f * PI * freq * t) * 26000.0f * TTS_VOLUME);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      frame[c * 2] = (int16_t)v;
+      frame[c * 2 + 1] = (int16_t)v;
+      c++;
+      i++;
+    }
+    Speaker.write((uint8_t *)frame, c * 2 * sizeof(int16_t));
+  }
+}
+
+// Fetch the whole clip into PSRAM before playing. Streaming would start sooner
+// but risks underruns mid-sentence if WiFi hiccups, and a glitch is far more
+// noticeable than a second of latency.
+static bool speak(const char *text) {
+  if (!gSpeakerReady || !text || !*text) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  JsonDocument req;
+  req["model"] = TTS_MODEL;
+  req["voice"] = TTS_VOICE;
+  req["input"] = text;
+  req["response_format"] = "pcm";
+  String body;
+  serializeJson(req, body);
+
+  NetworkClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(15);
+
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(30000);
+  http.setReuse(false);
+  if (!http.begin(client, "https://api.openai.com/v1/audio/speech")) return false;
+  http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+  http.addHeader("Content-Type", "application/json");
+
+  uint32_t t0 = millis();
+  int code = http.POST(body);
+  if (code != HTTP_CODE_OK) {
+    logf("tts http %d: %s", code, http.getString().substring(0, 120).c_str());
+    http.end();
+    return false;
+  }
+
+  BufferSink sink(gTtsBuf, gTtsCap);
+  http.writeToStream(&sink);
+  size_t got = sink.length();
+  if (got < 2) {
+    logf("tts returned no audio");
+    return false;
+  }
+  logf("tts %u KB in %lu ms, playing %.1f s",
+       (unsigned)(got / 1024), (unsigned long)(millis() - t0),
+       got / 2.0f / TTS_SAMPLE_RATE);
+
+  playPcm(gTtsBuf, got);
+  return true;
+}
+#endif  // TTS_ENABLED
+
 // ---------------------------------------------------------------- button ---
 // Simple debounce: the level has to stay put for DEBOUNCE_MS before it counts.
 static const uint32_t DEBOUNCE_MS = 25;
@@ -1132,14 +1334,12 @@ static bool allocateBuffer() {
 // behind a wake word, so we run it in command mode permanently and treat a
 // command hit as the wake.
 static bool startWakeWord() {
-  // input_format must describe THREE channels, not one. esp32-hal-sr.c hardcodes
-  // SR_CHANNEL_NUM = 3 and always expands whatever the fill callback returns
-  // into 3 interleaved channels before calling afe feed(). Passing "M" makes
-  // the AFE read that 3-channel stream as mono, so the detector only ever sees
-  // garbage and nothing is ever recognised. "MNN" = our mic in channel 0, the
-  // two channels the HAL zero-fills marked unused.
+  // Mono is "M" here: the format length must match the channel count, and
+  // 3.3.11 honours it via get_feed_channel_num(). The old "MNN" worked around
+  // 3.3.5 hardcoding SR_CHANNEL_NUM = 3, which is fixed now; leaving it would
+  // make the AFE process two permanently silent channels.
   esp_err_t err = sr_start(
-    srFill, nullptr, SR_CHANNELS_MONO, SR_MODE_COMMAND, "MNN",
+    srFill, nullptr, SR_CHANNELS_MONO, SR_MODE_COMMAND, "M",
     SR_COMMANDS, sizeof(SR_COMMANDS) / sizeof(SR_COMMANDS[0]), srEvent, nullptr
   );
   if (err != ESP_OK) {
@@ -1190,6 +1390,20 @@ void setup() {
   }
   logf("i2s up: bclk=%d ws=%d din=%d @ %lu Hz",
        PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DIN, (unsigned long)SAMPLE_RATE);
+
+#if TTS_ENABLED
+  if (speakerBegin()) {
+    // Loud, long and repeated: this is the isolation test for the amp, so it
+    // should be impossible to miss if the hardware path works at all.
+    uint32_t toneStart = millis();
+    for (int i = 0; i < 3; i++) {
+      playTone(1000, 400);
+      delay(150);
+    }
+    logf("test tone done in %lu ms (expected ~1650 ms)",
+         (unsigned long)(millis() - toneStart));
+  }
+#endif
 
   connectWiFi();
 
@@ -1276,9 +1490,16 @@ void loop() {
               research = true;
             }
           }
+          stripLinks(answer);
           emitAnswer(answer.c_str(), research ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, research);
           oledShow("Nova", answer.c_str());
           setStatus(STATUS_OK);
+#if TTS_ENABLED
+          // Still ST_UPLOADING here, so the detector ignores our own voice
+          // coming back through the mic and cannot self-trigger.
+          emitEvent("state", "state", "speaking");
+          speak(answer.c_str());
+#endif
         } else {
           oledShow("Error", "Could not reach OpenAI");
           setStatus(STATUS_ERROR);

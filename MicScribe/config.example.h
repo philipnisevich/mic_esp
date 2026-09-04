@@ -53,6 +53,17 @@
   "the date only if it matters. Plain text only: no markdown, no URLs, no " \
   "citations, no emoji."
 
+// ------------------------------------------------------------------- tts ---
+// Spoken replies through a MAX98357A. "pcm" gives raw 24 kHz 16-bit mono, so
+// no decoder is needed on-device. tts-1 measured ~1.6 s versus ~3.2 s for
+// gpt-4o-mini-tts, which matters when it sits in the response path.
+#define TTS_ENABLED 1
+#define TTS_MODEL   "tts-1"
+#define TTS_VOICE   "alloy"   // alloy, echo, fable, onyx, nova, shimmer
+#define TTS_SAMPLE_RATE 24000 // fixed by the API's pcm format
+#define TTS_VOLUME  0.85f     // 0.0-1.0, applied in software before I2S
+#define TTS_MAX_SECONDS 25    // buffer cap; ~48 KB per second in PSRAM
+
 // ------------------------------------------------------------------ oled ---
 // 0.96" SSD1306 over I2C. 128x64 is the usual 0.96" panel; set 32 for the
 // half-height 128x32 modules.
