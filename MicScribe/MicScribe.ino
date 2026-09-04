@@ -1191,6 +1191,95 @@ static void stripLinks(String &text) {
   text = out;
 }
 
+// Everything here is read aloud, and the models emit symbols however firmly the
+// prompt forbids them - we have already seen markdown and citations come back.
+// So rewrite the text into words before it reaches the speech API rather than
+// trusting the instruction.
+static void speechSanitize(String &text) {
+  // Parenthetical asides are almost always a restatement ("72F (22C)") and add
+  // nothing when spoken. Drop the whole span, nested included.
+  String stripped;
+  stripped.reserve(text.length());
+  int depth = 0;
+  for (int i = 0; i < (int)text.length(); i++) {
+    char c = text[i];
+    if (c == '(' || c == '[' || c == '{') { depth++; continue; }
+    if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; continue; }
+    if (depth == 0) stripped += c;
+  }
+
+  // Smart punctuation first: these are multi-byte UTF-8, and the character
+  // filter below would otherwise turn each byte into a space, so "It's" would
+  // be spoken as "It s".
+  stripped.replace("\u2019", "'");
+  stripped.replace("\u2018", "'");
+  stripped.replace("\u201C", "");
+  stripped.replace("\u201D", "");
+  stripped.replace("\u2026", ".");
+
+  // Units and signs that follow their number read correctly as suffixes.
+  stripped.replace("\u00B0C", " degrees celsius");
+  stripped.replace("\u00B0F", " degrees fahrenheit");
+  stripped.replace("\u00B0", " degrees");
+  stripped.replace("%", " percent");
+  stripped.replace("&", " and ");
+  stripped.replace("+", " plus ");
+  stripped.replace("=", " equals ");
+  stripped.replace("#", " number ");
+  stripped.replace("@", " at ");
+  stripped.replace("/", " ");
+  stripped.replace("\u2013", " to ");
+  stripped.replace("\u2014", ", ");
+
+  // Currency is the exception: the sign precedes its number, so move it after.
+  String out;
+  out.reserve(stripped.length() + 16);
+  for (int i = 0; i < (int)stripped.length(); i++) {
+    char c = stripped[i];
+    if (c == '$') {
+      int j = i + 1;
+      String number;
+      while (j < (int)stripped.length() &&
+             (isdigit((unsigned char)stripped[j]) || stripped[j] == '.' || stripped[j] == ',')) {
+        number += stripped[j++];
+      }
+      if (number.length()) {
+        out += number;
+        out += " dollars";
+        i = j - 1;
+      }
+      continue;  // a bare $ with no number is simply dropped
+    }
+    // Keep letters, digits and the punctuation that shapes speech; drop the rest.
+    if (isalnum((unsigned char)c) || c == ' ' || c == '.' || c == ',' ||
+        c == '\'' || c == '?' || c == '!' || c == '-' || c == ':') {
+      out += c;
+    } else {
+      out += ' ';
+    }
+  }
+
+  // Collapse the whitespace all that substitution leaves behind.
+  String tidy;
+  tidy.reserve(out.length());
+  bool lastSpace = false;
+  for (int i = 0; i < (int)out.length(); i++) {
+    char c = out[i];
+    if (c == ' ') {
+      if (!lastSpace && tidy.length()) tidy += c;
+      lastSpace = true;
+    } else {
+      if (lastSpace && (c == '.' || c == ',' || c == '?' || c == '!' || c == ':') && tidy.length()) {
+        tidy.remove(tidy.length() - 1);  // no space before punctuation
+      }
+      tidy += c;
+      lastSpace = false;
+    }
+  }
+  tidy.trim();
+  text = tidy;
+}
+
 static void emitAnswer(const char *text, const char *model, bool researched) {
   JsonDocument doc;
   doc["type"] = "answer";
@@ -1806,7 +1895,10 @@ void loop() {
           // Still ST_UPLOADING here, so the detector ignores our own voice
           // coming back through the mic and cannot self-trigger.
           emitEvent("state", "state", "speaking");
-          speak(answer.c_str());
+          String spoken = answer;
+          speechSanitize(spoken);
+          if (spoken != answer) logf("speaking as: %s", spoken.c_str());
+          speak(spoken.c_str());
 #endif
         } else {
           oledShow("Error", "Could not reach OpenAI");

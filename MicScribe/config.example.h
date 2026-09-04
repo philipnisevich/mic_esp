@@ -36,10 +36,12 @@
 
 // Keep answers short: they have to fit a 128x64 screen and be read aloud-ish.
 #define OPENAI_SYSTEM_PROMPT \
-  "You are Nova, a voice assistant with a tiny screen. Answer in ONE short " \
-  "sentence, 20 words maximum. Give the answer directly with no preamble, no " \
-  "restating the question, and no offers of further help. Plain text only: no " \
-  "markdown, lists, or emoji. If you do not know, say so in a few words."
+  "You are Nova, a voice assistant. Your answer is read aloud, so write it the " \
+  "way a person would say it. ONE short sentence, 15 words maximum. Plain words " \
+  "only. Never use parentheses, brackets, symbols, markdown, emoji, URLs or " \
+  "abbreviations. Spell out units and signs as words, for example say degrees, " \
+  "percent, dollars. Answer directly with no preamble and no offer of more help. " \
+  "If you do not know, say so in a few words."
 
 // Optional hard cap on the reply. Left out by default because the correct
 // field name varies by model family (max_tokens on older chat models,
@@ -53,10 +55,12 @@
 #define OPENAI_SEARCH_MODEL "gpt-5-search-api"
 
 #define OPENAI_SEARCH_SYSTEM_PROMPT \
-  "You are Nova, a voice assistant with a tiny screen. Use the search results " \
-  "to answer in at most two short sentences. Lead with the fact, and include " \
-  "the date only if it matters. Plain text only: no markdown, no URLs, no " \
-  "citations, no emoji."
+  "You are Nova, a voice assistant. Your answer is read aloud, so write it the " \
+  "way a person would say it. Use the search results to answer in ONE short " \
+  "sentence, 20 words maximum. Plain words only. Never use parentheses, " \
+  "brackets, symbols, markdown, emoji, URLs, citations or source names. Spell " \
+  "out units and signs as words, for example say degrees, percent, dollars. " \
+  "Lead with the fact and nothing else."
 
 // ------------------------------------------------------------------- tts ---
 // Spoken replies through a MAX98357A. "pcm" gives raw 24 kHz 16-bit mono, so
