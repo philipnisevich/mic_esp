@@ -2,6 +2,11 @@
 // Copy this file to "config.h" and fill in your values.
 // config.h is gitignored so your key never gets committed.
 
+// Used only on a completely fresh board (empty NVS). Once the WiFi setup
+// page (web/wifi-setup.html) provisions a network over serial, that choice
+// is saved to NVS and wins from then on - these values are never read again
+// until NVS is erased. Leave WIFI_SSID as "your-wifi-ssid" to skip the
+// compile-time default entirely and require provisioning at first boot.
 #define WIFI_SSID "your-wifi-ssid"
 #define WIFI_PASS "your-wifi-password"
 
@@ -58,11 +63,13 @@
 // no decoder is needed on-device. tts-1 measured ~1.6 s versus ~3.2 s for
 // gpt-4o-mini-tts, which matters when it sits in the response path.
 #define TTS_ENABLED 1
+// tts-1 is the fast one (~1.6 s). tts-1-hd sounds noticeably better on a
+// small speaker but roughly doubles the wait.
 #define TTS_MODEL   "tts-1"
 #define TTS_VOICE   "alloy"   // alloy, echo, fable, onyx, nova, shimmer
 #define TTS_SAMPLE_RATE 24000 // fixed by the API's pcm format
 #define TTS_VOLUME  1.0f      // floor gain; normalisation raises quiet clips
-#define TTS_MAX_BOOST 4.0f    // cap on that normalisation
+#define TTS_MAX_BOOST 3.0f    // cap on that normalisation; higher just clips
 #define TTS_MAX_SECONDS 25    // buffer cap; ~48 KB per second in PSRAM
 
 // ------------------------------------------------------------------ oled ---

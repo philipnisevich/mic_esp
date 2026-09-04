@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MicScribe WiFi Setup</title>
+<style>
+  :root {
+    --bg:      #0f1216;
+    --panel:   #171b21;
+    --border:  #2a3038;
+    --text:    #e6e9ef;
+    --dim:     #8890a0;
+    --accent:  #4fd1a5;
+    --accent-dim: #2b6b53;
+    --bad:     #e0665c;
+    --warn:    #e0b85c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 var(--mono);
+  }
+  body { padding: 24px 16px 60px; }
+  main { max-width: 640px; margin: 0 auto; }
+
+  h1 { font-size: 18px; margin: 0 0 4px; letter-spacing: 0.02em; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 24px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 18px 20px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--dim); margin: 0 0 14px; font-weight: 600;
+  }
+  .panel[data-disabled="true"] { opacity: 0.45; pointer-events: none; }
+
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  button {
+    font: 600 13px/1 var(--mono);
+    color: var(--bg); background: var(--accent);
+    border: none; border-radius: 7px;
+    padding: 10px 16px; cursor: pointer;
+    letter-spacing: 0.02em;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { background: var(--border); color: var(--dim); cursor: not-allowed; }
+  button.secondary {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--border);
+  }
+  button.secondary:hover { border-color: var(--accent); }
+
+  input[type="text"], input[type="password"] {
+    font: 14px var(--mono); color: var(--text);
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 9px 11px;
+    flex: 1; min-width: 160px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dim); margin-right: 8px; flex: none;
+  }
+  .status-dot.ok   { background: var(--accent); }
+  .status-dot.bad  { background: var(--bad); }
+  .status-dot.busy { background: var(--warn); }
+  .status-line { display: flex; align-items: center; font-size: 13px; color: var(--dim); }
+
+  ul.nets { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  ul.nets li {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 10px; border-radius: 6px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  ul.nets li:hover { background: rgba(255,255,255,0.03); }
+  ul.nets li.selected { border-color: var(--accent); background: rgba(79,209,165,0.08); }
+  ul.nets li .ssid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ul.nets li .lock { color: var(--dim); font-size: 12px; flex: none; }
+  ul.nets .bars { display: flex; align-items: flex-end; gap: 2px; height: 12px; flex: none; }
+  ul.nets .bars span { width: 3px; background: var(--border); border-radius: 1px; }
+  ul.nets .bars span.on { background: var(--accent); }
+  .empty-hint { color: var(--dim); font-size: 13px; padding: 6px 2px; }
+
+  .field-label { font-size: 12px; color: var(--dim); margin: 14px 0 6px; }
+  .pw-row { position: relative; }
+  .pw-row button.toggle {
+    position: absolute; right: 4px; top: 4px; bottom: 4px;
+    background: transparent; color: var(--dim); padding: 0 10px;
+    border: none; font-size: 11px;
+  }
+
+  #log {
+    font-size: 12px; color: var(--dim);
+    background: #0a0c0f; border: 1px solid var(--border); border-radius: 7px;
+    padding: 10px 12px; height: 160px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #log .evt-error   { color: var(--bad); }
+  #log .evt-status  { color: var(--accent); }
+  #log .evt-log     { color: var(--dim); }
+
+  .hint { color: var(--dim); font-size: 12px; margin-top: 10px; }
+  code { color: var(--text); background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MicScribe &middot; WiFi Setup</h1>
+  <p class="sub">Connect over USB, pick a network, send the password to the board. No reflash needed.</p>
+
+  <section class="panel" id="panel-connect">
+    <h2>1. Device</h2>
+    <div class="row">
+      <button id="btn-connect">Connect over USB</button>
+      <button id="btn-disconnect" class="secondary" disabled>Disconnect</button>
+    </div>
+    <div class="status-line" style="margin-top: 12px;">
+      <span class="status-dot" id="conn-dot"></span>
+      <span id="conn-text">Not connected</span>
+    </div>
+    <p class="hint" id="browser-hint"></p>
+  </section>
+
+  <section class="panel" id="panel-scan" data-disabled="true">
+    <h2>2. Network</h2>
+    <div class="row">
+      <button id="btn-scan">Scan for networks</button>
+      <span class="status-line" id="scan-text" style="margin-left: 4px;"></span>
+    </div>
+    <ul class="nets" id="net-list"></ul>
+    <div class="empty-hint" id="net-empty">No scan yet.</div>
+
+    <div class="field-label">SSID</div>
+    <input type="text" id="ssid" placeholder="network name" autocomplete="off">
+
+    <div class="field-label">Password</div>
+    <div class="pw-row">
+      <input type="password" id="pass" placeholder="leave blank for an open network" autocomplete="off">
+      <button class="toggle" id="btn-show-pass" type="button">show</button>
+    </div>
+
+    <div class="row" style="margin-top: 16px;">
+      <button id="btn-send">Send to board</button>
+      <span class="status-line" id="wifi-text"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+
+  <p class="hint">
+    Credentials are sent once, over the wire, only to the board plugged into
+    this computer — they are saved on-device (in NVS) and never leave it again.
+    Works in Chrome or Edge; Web Serial isn't supported in Safari or Firefox.
+  </p>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+let port = null;
+let writer = null;
+let reader = null;
+let readableClosed = null;
+let selectedSsid = null;
+
+function log(text, cls) {
+  const el = $("log");
+  const line = document.createElement("div");
+  if (cls) line.className = "evt-" + cls;
+  line.textContent = text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setConn(state, text) {
+  const dot = $("conn-dot");
+  dot.className = "status-dot" + (state ? " " + state : "");
+  $("conn-text").textContent = text;
+}
+
+function setPanelEnabled(id, enabled) {
+  $(id).dataset.disabled = enabled ? "false" : "true";
+}
+
+// ------------------------------------------------------------- transport ---
+async function connect() {
+  if (!("serial" in navigator)) {
+    log("Web Serial is not available in this browser.", "error");
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+  } catch (e) {
+    log("connect failed: " + e.message, "error");
+    return;
+  }
+
+  writer = port.writable.getWriter();
+  setConn("ok", "Connected");
+  $("btn-connect").disabled = true;
+  $("btn-disconnect").disabled = false;
+  setPanelEnabled("panel-scan", true);
+  log("serial port open");
+
+  readLoop();
+  // Find out if it's already on a network before the user does anything.
+  sendCommand({ cmd: "wifi_status" });
+}
+
+async function disconnect() {
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (writer) { writer.releaseLock(); } } catch (e) {}
+  try { if (readableClosed) await readableClosed.catch(() => {}); } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  port = null; writer = null; reader = null; readableClosed = null;
+
+  setConn("", "Not connected");
+  $("btn-connect").disabled = false;
+  $("btn-disconnect").disabled = true;
+  setPanelEnabled("panel-scan", false);
+  log("disconnected");
+}
+
+async function readLoop() {
+  const decoder = new TextDecoderStream();
+  readableClosed = port.readable.pipeTo(decoder.writable);
+  reader = decoder.readable.getReader();
+  let buf = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        if (line) handleLine(line);
+      }
+    }
+  } catch (e) {
+    log("read error: " + e.message, "error");
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
+}
+
+async function sendCommand(obj) {
+  if (!writer) { log("not connected", "error"); return; }
+  const json = JSON.stringify(obj) + "\n";
+  try {
+    await writer.write(new TextEncoder().encode(json));
+  } catch (e) {
+    log("write failed: " + e.message, "error");
+  }
+}
+
+navigator.serial && navigator.serial.addEventListener("disconnect", (e) => {
+  if (port && e.target === port) {
+    log("device unplugged", "error");
+    disconnect();
+  }
+});
+
+// -------------------------------------------------------------- protocol ---
+function handleLine(line) {
+  if (line.startsWith("# ")) {
+    log(line.slice(2), "log");
+    return;
+  }
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch (e) {
+    log(line, "log");
+    return;
+  }
+  switch (msg.type) {
+    case "wifi_scan_result": return onScanResult(msg);
+    case "wifi_status":      return onWifiStatus(msg);
+    case "error":            return log("device error: " + msg.error, "error");
+    default:
+      log(JSON.stringify(msg), "log");
+  }
+}
+
+function bars(rssi) {
+  // Rough dBm -> 1-4 bar mapping.
+  const level = rssi >= -50 ? 4 : rssi >= -60 ? 3 : rssi >= -70 ? 2 : 1;
+  let html = '<span class="bars">';
+  const heights = [4, 7, 10, 13];
+  for (let i = 0; i < 4; i++) {
+    html += `<span style="height:${heights[i]}px" class="${i < level ? "on" : ""}"></span>`;
+  }
+  return html + "</span>";
+}
+
+function onScanResult(msg) {
+  const nets = (msg.networks || []).slice();
+  $("scan-text").textContent = `${nets.length} network${nets.length === 1 ? "" : "s"} found`;
+  const list = $("net-list");
+  list.innerHTML = "";
+  $("net-empty").style.display = nets.length ? "none" : "block";
+  $("net-empty").textContent = "No networks found. Try scanning again.";
+
+  for (const net of nets) {
+    const li = document.createElement("li");
+    li.className = net.ssid === selectedSsid ? "selected" : "";
+    li.innerHTML = `${bars(net.rssi)}<span class="ssid">${escapeHtml(net.ssid)}</span>` +
+                   `<span class="lock">${net.secure ? "\u{1F512}" : "open"}</span>`;
+    li.addEventListener("click", () => selectNetwork(net.ssid, li));
+    list.appendChild(li);
+  }
+}
+
+function selectNetwork(ssid, li) {
+  selectedSsid = ssid;
+  $("ssid").value = ssid;
+  $("pass").value = "";
+  $("pass").focus();
+  document.querySelectorAll("#net-list li").forEach((el) => el.classList.remove("selected"));
+  if (li) li.classList.add("selected");
+}
+
+function onWifiStatus(msg) {
+  const map = { connecting: "busy", connected: "ok", failed: "bad", disconnected: "" };
+  const dot = map[msg.status] ?? "";
+  const el = $("wifi-text");
+  el.innerHTML = `<span class="status-dot ${dot}"></span>`;
+  if (msg.status === "connecting") {
+    el.append(`connecting to ${msg.ssid}...`);
+  } else if (msg.status === "connected") {
+    el.append(`connected to ${msg.ssid}${msg.ip ? " (" + msg.ip + ")" : ""}`);
+    log(`board is on "${msg.ssid}"${msg.ip ? " at " + msg.ip : ""}`, "status");
+  } else if (msg.status === "failed") {
+    el.append(`failed to connect to ${msg.ssid} - check the password`);
+  } else {
+    el.append("board is not on a network yet");
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+// ------------------------------------------------------------------- ui ----
+$("btn-connect").addEventListener("click", connect);
+$("btn-disconnect").addEventListener("click", disconnect);
+
+$("btn-scan").addEventListener("click", () => {
+  $("scan-text").textContent = "scanning...";
+  sendCommand({ cmd: "wifi_scan" });
+});
+
+$("btn-show-pass").addEventListener("click", () => {
+  const pass = $("pass");
+  const show = pass.type === "password";
+  pass.type = show ? "text" : "password";
+  $("btn-show-pass").textContent = show ? "hide" : "show";
+});
+
+$("btn-send").addEventListener("click", () => {
+  const ssid = $("ssid").value.trim();
+  const pass = $("pass").value;
+  if (!ssid) { log("enter or pick a network name first", "error"); return; }
+  $("wifi-text").innerHTML = "";
+  sendCommand({ cmd: "wifi_connect", ssid, pass });
+});
+
+if (!("serial" in navigator)) {
+  $("browser-hint").textContent =
+    "This browser has no Web Serial support - open this page in Chrome or Edge.";
+  $("btn-connect").disabled = true;
+}
+</script>
+</body>
+</html>

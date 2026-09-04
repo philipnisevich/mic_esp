@@ -39,8 +39,13 @@ Pins live at the top of `MicScribe/MicScribe.ino` if you want to move them.
    cp MicScribe/config.example.h MicScribe/config.h
    ```
 
-   Fill in your WiFi credentials and an ElevenLabs API key from
+   Fill in an ElevenLabs API key from
    <https://elevenlabs.io/app/settings/api-keys>. `config.h` is gitignored.
+
+   WiFi credentials are optional here — leave `WIFI_SSID` as the placeholder
+   and provision the network after flashing instead (see
+   [WiFi setup](#wifi-setup) below), or fill them in if you'd rather bake in
+   a default.
 
 2. **Flash**
 
@@ -74,6 +79,48 @@ Pins live at the top of `MicScribe/MicScribe.ino` if you want to move them.
 
    Hold the button, say something, release. The transcript appears within a
    second or two.
+
+## WiFi setup
+
+`web/wifi-setup.html` is a self-contained page (no server, no build step)
+that talks to the board over [Web Serial](https://developer.chrome.com/docs/capabilities/serial),
+so you aren't locked into whatever network was configured at flash time.
+Open it directly in Chrome or Edge — Safari and Firefox don't implement Web
+Serial:
+
+```bash
+open web/wifi-setup.html
+```
+
+1. **Connect over USB** — picks the board's serial port. Only one thing can
+   hold the port at a time, so close `arduino-cli monitor`/`bridge`/the
+   Arduino IDE first.
+2. **Scan for networks** — lists what the board can see, strongest first,
+   with a lock icon on secured ones. Click one to fill in the SSID, or type
+   a hidden network's name by hand.
+3. Enter the password and **Send to board**.
+
+The board saves the credentials to NVS on a successful connection and uses
+them on every boot after that, ahead of the `WIFI_SSID`/`WIFI_PASS` compile-time
+defaults in `config.h` — so re-provisioning in the field never reverts to
+whatever was baked in at flash time. A failed attempt (wrong password) is
+not saved, so it can't strand the board on bad credentials.
+
+This rides the same serial connection as everything else, using the same
+line-oriented JSON convention (see [Serial protocol](#serial-protocol)):
+
+```json
+{"cmd":"wifi_scan"}
+{"cmd":"wifi_connect","ssid":"...","pass":"..."}
+{"cmd":"wifi_status"}
+```
+
+```json
+{"type":"wifi_scan_result","networks":[{"ssid":"Home","rssi":-45,"secure":true}]}
+{"type":"wifi_status","status":"connecting","ssid":"Home"}
+{"type":"wifi_status","status":"connected","ssid":"Home","ip":"192.168.1.44"}
+{"type":"wifi_status","status":"failed","ssid":"Home"}
+```
 
 ## Wake word
 
@@ -211,6 +258,10 @@ Two kinds of line come out of the board, so a bridge never has to guess:
 {"type":"error","error":"http 401: {\"detail\":...}"}
 ```
 
+The board also accepts JSON commands in the other direction, one per line,
+used by the [WiFi setup](#wifi-setup) page — `{"cmd":"wifi_scan"}`,
+`{"cmd":"wifi_connect","ssid":"...","pass":"..."}`, `{"cmd":"wifi_status"}`.
+
 ## Bridge
 
 ```bash
@@ -308,5 +359,7 @@ MicScribe/
 bridge/
   bridge.py            optional host-side listener: print / clipboard / type
   bridge.sh            `bridge run|stop|status` shell command
+web/
+  wifi-setup.html     Web Serial page for provisioning WiFi post-flash
 flash.sh               compile + upload helper
 ```

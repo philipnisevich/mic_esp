@@ -19,6 +19,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <NetworkClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -397,6 +398,181 @@ static void emitTranscript(const char *text, const char *language) {
   if (language && *language) doc["language"] = language;
   serializeJson(doc, Serial);
   Serial.println();
+}
+
+// --------------------------------------------------------- wifi provision ---
+// Runtime WiFi setup over the same serial port, so the network isn't fixed at
+// flash time. Credentials live in NVS (via Preferences) and take priority over
+// the WIFI_SSID/WIFI_PASS compile-time defaults in config.h, which now serve
+// only as the value used on a completely fresh board.
+//
+// Host protocol (one JSON object per line, matching the output convention):
+//   {"cmd":"wifi_scan"}                            -> triggers a scan
+//   {"cmd":"wifi_connect","ssid":"...","pass":"..."} -> connects and persists
+//   {"cmd":"wifi_status"}                          -> reports current status
+//
+// Emitted in response:
+//   {"type":"wifi_scan_result","networks":[{"ssid":"...","rssi":-51,"secure":true}]}
+//   {"type":"wifi_status","status":"connecting","ssid":"..."}
+//   {"type":"wifi_status","status":"connected","ssid":"...","ip":"..."}
+//   {"type":"wifi_status","status":"failed","ssid":"..."}
+//   {"type":"wifi_status","status":"disconnected"}
+static Preferences gWifiPrefs;
+static bool gWifiScanRunning = false;
+
+static void wifiPrefsLoad(String &ssid, String &pass) {
+  gWifiPrefs.begin("wifi", true);
+  ssid = gWifiPrefs.getString("ssid", "");
+  pass = gWifiPrefs.getString("pass", "");
+  gWifiPrefs.end();
+}
+
+static void wifiPrefsSave(const String &ssid, const String &pass) {
+  gWifiPrefs.begin("wifi", false);
+  gWifiPrefs.putString("ssid", ssid);
+  gWifiPrefs.putString("pass", pass);
+  gWifiPrefs.end();
+}
+
+static void emitWifiStatus(const char *status, const char *ssid = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "wifi_status";
+  doc["status"] = status;
+  if (ssid) doc["ssid"] = ssid;
+  if (strcmp(status, "connected") == 0) doc["ip"] = WiFi.localIP().toString();
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+// Async, so a scan (2-4 s) never blocks audio capture or the OLED. loop()
+// polls wifiPollScan() for the result.
+static void wifiStartScan() {
+  if (gWifiScanRunning) return;
+  WiFi.scanDelete();
+  int16_t r = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+  gWifiScanRunning = (r == WIFI_SCAN_RUNNING);
+  logf("wifi scan started");
+}
+
+static void wifiPollScan() {
+  if (!gWifiScanRunning) return;
+  int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  gWifiScanRunning = false;
+  if (n < 0) {
+    logf("wifi scan failed");
+    return;
+  }
+
+  // Collapse duplicate SSIDs (multiple APs on one network) down to the
+  // strongest signal, and cap the list at something a small screen can show.
+  struct Net { String ssid; int32_t rssi; bool secure; };
+  static const int MAX_NETS = 40;
+  Net nets[MAX_NETS];
+  int count = 0;
+  for (int i = 0; i < n && count < MAX_NETS; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    int32_t rssi = WiFi.RSSI(i);
+    bool secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    int existing = -1;
+    for (int j = 0; j < count; j++) {
+      if (nets[j].ssid == ssid) { existing = j; break; }
+    }
+    if (existing >= 0) {
+      if (rssi > nets[existing].rssi) nets[existing].rssi = rssi;
+    } else {
+      nets[count++] = Net{ ssid, rssi, secure };
+    }
+  }
+  for (int i = 1; i < count; i++) {
+    Net key = nets[i];
+    int j = i - 1;
+    while (j >= 0 && nets[j].rssi < key.rssi) { nets[j + 1] = nets[j]; j--; }
+    nets[j + 1] = key;
+  }
+
+  JsonDocument doc;
+  doc["type"] = "wifi_scan_result";
+  JsonArray arr = doc["networks"].to<JsonArray>();
+  for (int i = 0; i < count; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["ssid"] = nets[i].ssid;
+    o["rssi"] = nets[i].rssi;
+    o["secure"] = nets[i].secure;
+  }
+  serializeJson(doc, Serial);
+  Serial.println();
+  WiFi.scanDelete();
+  logf("wifi scan: %d network(s)", count);
+}
+
+// Synchronous: a deliberate user action from the provisioning page, so a
+// few-second block is fine. Saves to NVS only on success, so a typo'd
+// password never overwrites a working set of credentials.
+static void wifiConnectAndSave(const String &ssid, const String &pass) {
+  logf("wifi: connecting to %s (provisioning)", ssid.c_str());
+  emitWifiStatus("connecting", ssid.c_str());
+  oledShow("WiFi Setup", ssid.c_str());
+
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiPrefsSave(ssid, pass);
+    logf("wifi ok, ip %s", WiFi.localIP().toString().c_str());
+    emitWifiStatus("connected", ssid.c_str());
+    oledShow("WiFi Setup", "Connected");
+  } else {
+    logf("wifi FAILED to connect to %s", ssid.c_str());
+    emitWifiStatus("failed", ssid.c_str());
+    oledShow("WiFi Setup", "Failed - retry");
+  }
+}
+
+static void handleWifiCommand(JsonDocument &doc, const char *cmd) {
+  if (strcmp(cmd, "wifi_scan") == 0) {
+    wifiStartScan();
+  } else if (strcmp(cmd, "wifi_connect") == 0) {
+    String ssid = doc["ssid"] | "";
+    String pass = doc["pass"] | "";
+    if (ssid.length() > 0) wifiConnectAndSave(ssid, pass);
+  } else if (strcmp(cmd, "wifi_status") == 0) {
+    if (WiFi.status() == WL_CONNECTED) {
+      emitWifiStatus("connected", WiFi.SSID().c_str());
+    } else {
+      emitWifiStatus("disconnected");
+    }
+  }
+}
+
+// One JSON object per line in from the host, mirroring what goes out. Fed a
+// byte at a time from loop() so a slow/partial write never stalls anything.
+static void pollSerialCommands() {
+  static String lineBuf;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      lineBuf.trim();
+      if (lineBuf.length() > 0) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, lineBuf)) {
+          const char *cmd = doc["cmd"] | "";
+          if (*cmd) handleWifiCommand(doc, cmd);
+        }
+      }
+      lineBuf = "";
+    } else if (c != '\r') {
+      lineBuf += c;
+      if (lineBuf.length() > 512) lineBuf = "";  // guard against line noise
+    }
+  }
 }
 
 // -------------------------------------------------------- multipart body ---
@@ -1205,15 +1381,25 @@ static void playPcm(const uint8_t *pcm, size_t bytes, float gain) {
   while (i < total) {
     size_t n = 0;
     while (n < 254 && i < total) {
-      int32_t v = (int32_t)(src[i++] * gain);
-      if (v > 32767) v = 32767;
-      if (v < -32768) v = -32768;
-      // Each 24 kHz sample becomes two 48 kHz frames, both slots identical.
-      frame[n * 2] = v << 16;
-      frame[n * 2 + 1] = v << 16;
+      // 24 -> 48 kHz. Duplicating each sample (zero-order hold) is cheap but
+      // leaves a full-amplitude image around the Nyquist point, which is what
+      // makes it sound gritty. Averaging with the next sample is a 2-tap FIR
+      // that puts a null right there - far cleaner for one extra add.
+      int32_t cur = (int32_t)(src[i] * gain);
+      int32_t nxt = (i + 1 < total) ? (int32_t)(src[i + 1] * gain) : cur;
+      i++;
+
+      int32_t mid = (cur + nxt) / 2;
+      if (cur > 32767) cur = 32767;
+      if (cur < -32768) cur = -32768;
+      if (mid > 32767) mid = 32767;
+      if (mid < -32768) mid = -32768;
+
+      frame[n * 2] = cur << 16;
+      frame[n * 2 + 1] = cur << 16;
       n++;
-      frame[n * 2] = v << 16;
-      frame[n * 2 + 1] = v << 16;
+      frame[n * 2] = mid << 16;
+      frame[n * 2 + 1] = mid << 16;
       n++;
     }
     // Blocking write: the DMA queue paces this loop for us.
@@ -1295,9 +1481,12 @@ static bool speak(const char *text) {
     if (mag > peak) peak = mag;
   }
 
+  // Target well short of full scale. At 3V3 the amplifier runs out of swing
+  // before the samples do, so normalising to ~95% buys a little loudness and a
+  // lot of clipping distortion. 80% keeps transients clean.
   float gain = TTS_VOLUME;
   if (peak > 0) {
-    float boost = 31000.0f / (float)peak;
+    float boost = 26000.0f / (float)peak;
     if (boost > TTS_MAX_BOOST) boost = TTS_MAX_BOOST;
     if (boost > 1.0f) gain = boost;
   }
@@ -1330,16 +1519,37 @@ static bool buttonPressedStable() {
 }
 
 // ----------------------------------------------------------------- setup ---
+// NVS (set by the provisioning page) wins over the config.h defaults, so a
+// board reprovisioned in the field never reverts to its flash-time network.
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logf("connecting to %s", WIFI_SSID);
-  oledShow("WiFi", WIFI_SSID);
 
+  String ssid, pass;
+  wifiPrefsLoad(ssid, pass);
+  if (ssid.length() == 0 && strcmp(WIFI_SSID, "your-wifi-ssid") != 0) {
+    ssid = WIFI_SSID;
+    pass = WIFI_PASS;
+  }
+
+  if (ssid.length() == 0) {
+    logf("no WiFi credentials stored - connect over USB to set one");
+    oledShow("WiFi Setup", "Connect via USB");
+    return;
+  }
+
+  logf("connecting to %s", ssid.c_str());
+  oledShow("WiFi", ssid.c_str());
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  // Stay responsive to the provisioning page even while the initial connect
+  // is pending, so a wrong password saved at flash time doesn't strand the
+  // board for 20 s with no way to fix it short of a reflash.
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(250);
+    pollSerialCommands();
+    wifiPollScan();
+    delay(50);
   }
   if (WiFi.status() == WL_CONNECTED) {
     logf("wifi ok, ip %s, rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
@@ -1496,6 +1706,9 @@ void setup() {
 }
 
 void loop() {
+  pollSerialCommands();
+  wifiPollScan();
+
   gButtonHeld = buttonPressedStable();
 
   // Edge-trigger the display so a finished answer stays on screen instead of
