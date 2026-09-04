@@ -1631,6 +1631,11 @@ static int16_t *gRtRing = nullptr;
 static volatile size_t gRtHead = 0, gRtTail = 0;
 static String gRtTranscript;
 static bool gRtSawAudio = false;
+static uint32_t gRtRxBytes = 0;   // mu-law received from the API
+static uint32_t gRtTxBytes = 0;   // mu-law sent from the microphone
+static uint32_t gRtPlayed = 0;    // samples actually written to I2S
+static uint32_t gRtEvents = 0;    // websocket messages seen
+static uint32_t gRtDropped = 0;   // ring overruns
 
 static inline size_t rtAvailable() {
   size_t h = gRtHead, t = gRtTail;
@@ -1667,6 +1672,7 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
 
   JsonDocument doc;
   if (deserializeJson(doc, msg.data(), DeserializationOption::Filter(filter))) return;
+  gRtEvents++;
 
   const char *type = doc["type"] | "";
 
@@ -1681,9 +1687,10 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
                               (const unsigned char *)b64, b64Len) != 0) {
       return;
     }
+    gRtRxBytes += outLen;
     for (size_t i = 0; i < outLen; i++) {
       size_t next = (gRtHead + 1) % RT_RING;
-      if (next == gRtTail) break;  // ring full: drop rather than overwrite
+      if (next == gRtTail) { gRtDropped++; break; }  // ring full
       gRtRing[gRtHead] = ulawToPcm(decoded[i]);
       gRtHead = next;
     }
@@ -1701,7 +1708,12 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
 // so the amplifier sees the rate it actually supports.
 static void rtPlayBlock() {
   static int16_t src[161];
-  static int32_t frame[160 * 6 * 2];
+  // 7.7 KB, and internal RAM is exactly what the TLS handshake is short of.
+  static int32_t *frame = nullptr;
+  if (!frame) {
+    frame = (int32_t *)ps_malloc(160 * 6 * 2 * sizeof(int32_t));
+    if (!frame) return;
+  }
 
   size_t have = rtAvailable();
   if (have < 161) return;
@@ -1725,6 +1737,7 @@ static void rtPlayBlock() {
     }
   }
   Speaker.write((uint8_t *)frame, f * 2 * sizeof(int32_t));
+  gRtPlayed += 160;
 }
 
 static bool rtSendJson(JsonDocument &doc) {
@@ -1746,6 +1759,7 @@ static void realtimeSession() {
   gRtHead = gRtTail = 0;
   gRtTranscript = "";
   gRtSawAudio = false;
+  gRtRxBytes = gRtTxBytes = gRtPlayed = gRtEvents = gRtDropped = 0;
 
   setStatus(STATUS_WORKING);
   oledShow("Nova", "Connecting...");
@@ -1757,10 +1771,28 @@ static void realtimeSession() {
   gWs.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
   gWs.onMessage(rtOnMessage);
 
+  logf("heap before connect: free=%u largest=%u",
+       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
+  // The TLS probe that used to live here confirmed transport is fine and the
+  // failures are in the websocket upgrade, so it is gone: opening and tearing
+  // down a full TLS session immediately before the real one only fragments the
+  // heap at the worst moment.
+
   String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
   uint32_t t0 = millis();
-  if (!gWs.connect(url)) {
-    logf("realtime connect failed");
+
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+    connected = gWs.connect(url);
+    if (!connected) {
+      logf("connect attempt %d failed (largest block %u)",
+           attempt, (unsigned)ESP.getMaxAllocHeap());
+      delay(400);
+    }
+  }
+  if (!connected) {
+    logf("realtime connect failed after 3 attempts");
     oledShow("Error", "Could not connect");
     setStatus(STATUS_ERROR);
     return;
@@ -1851,6 +1883,7 @@ static void realtimeSession() {
         msg["type"] = "input_audio_buffer.append";
         msg["audio"] = b64;
         rtSendJson(msg);
+        gRtTxBytes += ulawLen;
       }
       ulawLen = 0;
     }
@@ -1866,8 +1899,13 @@ static void realtimeSession() {
   }
 
   gWs.close();
-  logf("realtime session ended after %lu ms%s",
-       (unsigned long)(millis() - start), gRtSawAudio ? "" : " (no audio received)");
+  logf("realtime ended after %lu ms: events=%lu tx=%lu B (%.1f s) rx=%lu B (%.1f s) "
+       "played=%.1f s dropped=%lu",
+       (unsigned long)(millis() - start), (unsigned long)gRtEvents,
+       (unsigned long)gRtTxBytes, gRtTxBytes / 8000.0f,
+       (unsigned long)gRtRxBytes, gRtRxBytes / 8000.0f,
+       gRtPlayed / 8000.0f, (unsigned long)gRtDropped);
+  if (gRtTranscript.length()) logf("said: %s", gRtTranscript.c_str());
   if (gRtTranscript.length()) emitEvent("answer", "text", gRtTranscript.c_str());
 }
 #endif  // REALTIME_ENABLED
@@ -2089,8 +2127,11 @@ void loop() {
     gWakeRequested = false;
     gState = ST_UPLOADING;  // stops the detector re-triggering mid-session
 
-    // ESP-SR saturates both cores; leaving it running costs the socket most of
-    // its throughput, and nothing needs detecting once a session is open.
+    // sr_pause(), not sr_stop(). Tearing ESP-SR down from loop() while its feed
+    // task may be inside our fill callback corrupts the heap - seen as
+    // "CORRUPT HEAP: Bad tail" in PSRAM on every wake. It is also unnecessary:
+    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL is 4096, so mbedtls's large buffers
+    // already come from PSRAM rather than the internal block.
     sr_pause();
     realtimeSession();
     sr_resume();
