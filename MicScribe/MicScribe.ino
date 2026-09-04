@@ -1626,7 +1626,10 @@ static WebsocketsClient gWs;
 
 // Decoded 8 kHz audio waiting to be played. The socket callback fills it and
 // the session loop drains it in small blocks, so neither starves the other.
-static const size_t RT_RING = 8000 * 10;  // 10 s at 8 kHz
+// Audio arrives faster than it plays, so the ring has to hold a whole reply,
+// not a few seconds of it. A 10.9 s answer overran the old 10 s ring and lost
+// 0.2 s. 45 s costs 720 KB of PSRAM, of which there is 2.7 MB spare.
+static const size_t RT_RING = 8000 * 45;
 static int16_t *gRtRing = nullptr;
 static volatile size_t gRtHead = 0, gRtTail = 0;
 static String gRtTranscript;
