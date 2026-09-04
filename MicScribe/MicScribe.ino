@@ -28,6 +28,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ArduinoWebsockets.h>
+#include "mbedtls/base64.h"
 
 #include "config.h"
 
@@ -757,6 +759,13 @@ static void endCapture(const char *reason) {
 // audio buffers are written, which is what keeps the state machine race-free.
 static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
   if (n == 0) return;
+#if REALTIME_ENABLED
+  // The realtime session reads I2S itself, so this callback only has to keep
+  // feeding the wake-word detector. No capture buffers, no VAD, no pre-roll.
+  (void)pcm16;
+  (void)level;
+  return;
+#else
   uint32_t chunkMs = (uint32_t)((n * 1000) / SAMPLE_RATE);
 
   uint8_t st = gState;
@@ -801,6 +810,7 @@ static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
   }
 
   if (gSamples >= gMaxSamples) endCapture("length limit");
+#endif  // REALTIME_ENABLED
 }
 
 // ESP-SR pulls audio through this instead of reading I2S itself, which lets a
@@ -1607,6 +1617,261 @@ static bool speak(const char *text) {
 }
 #endif  // TTS_ENABLED
 
+
+// ------------------------------------------------------------- realtime ----
+#if REALTIME_ENABLED
+using namespace websockets;
+
+static WebsocketsClient gWs;
+
+// Decoded 8 kHz audio waiting to be played. The socket callback fills it and
+// the session loop drains it in small blocks, so neither starves the other.
+static const size_t RT_RING = 8000 * 10;  // 10 s at 8 kHz
+static int16_t *gRtRing = nullptr;
+static volatile size_t gRtHead = 0, gRtTail = 0;
+static String gRtTranscript;
+static bool gRtSawAudio = false;
+
+static inline size_t rtAvailable() {
+  size_t h = gRtHead, t = gRtTail;
+  return (h >= t) ? (h - t) : (RT_RING - t + h);
+}
+
+// G.711 mu-law. Both directions are a handful of shifts - no table needed.
+static inline int16_t ulawToPcm(uint8_t u) {
+  u = ~u;
+  int16_t t = ((u & 0x0F) << 3) + 0x84;
+  t <<= ((unsigned)u & 0x70) >> 4;
+  return (u & 0x80) ? (0x84 - t) : (t - 0x84);
+}
+
+static inline uint8_t pcmToUlaw(int16_t pcm) {
+  const int16_t BIAS = 0x84, CLIP = 32635;
+  int sign = (pcm >> 8) & 0x80;
+  if (sign) pcm = -pcm;
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+  int exponent = 7;
+  for (int mask = 0x4000; (pcm & mask) == 0 && exponent > 0; exponent--, mask >>= 1) {}
+  int mantissa = (pcm >> (exponent + 3)) & 0x0F;
+  return (uint8_t)~(sign | (exponent << 4) | mantissa);
+}
+
+static void rtOnMessage(websockets::WebsocketsMessage msg) {
+  // Only two fields matter on the hot path, and audio frames are several KB,
+  // so filter rather than materialise the whole event.
+  JsonDocument filter;
+  filter["type"] = true;
+  filter["delta"] = true;
+  filter["error"]["message"] = true;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, msg.data(), DeserializationOption::Filter(filter))) return;
+
+  const char *type = doc["type"] | "";
+
+  if (!strcmp(type, "response.output_audio.delta")) {
+    const char *b64 = doc["delta"] | "";
+    size_t b64Len = strlen(b64);
+    if (!b64Len || !gRtRing) return;
+
+    static uint8_t decoded[4096];
+    size_t outLen = 0;
+    if (mbedtls_base64_decode(decoded, sizeof(decoded), &outLen,
+                              (const unsigned char *)b64, b64Len) != 0) {
+      return;
+    }
+    for (size_t i = 0; i < outLen; i++) {
+      size_t next = (gRtHead + 1) % RT_RING;
+      if (next == gRtTail) break;  // ring full: drop rather than overwrite
+      gRtRing[gRtHead] = ulawToPcm(decoded[i]);
+      gRtHead = next;
+    }
+    gRtSawAudio = true;
+
+  } else if (!strcmp(type, "response.output_audio_transcript.delta")) {
+    gRtTranscript += (const char *)(doc["delta"] | "");
+
+  } else if (!strcmp(type, "error")) {
+    logf("realtime error: %s", (const char *)(doc["error"]["message"] | "unknown"));
+  }
+}
+
+// Pop one 20 ms block and play it. 8 kHz in, 48 kHz out, linearly interpolated
+// so the amplifier sees the rate it actually supports.
+static void rtPlayBlock() {
+  static int16_t src[161];
+  static int32_t frame[160 * 6 * 2];
+
+  size_t have = rtAvailable();
+  if (have < 161) return;
+
+  for (size_t i = 0; i < 161; i++) {
+    src[i] = gRtRing[(gRtTail + i) % RT_RING];
+  }
+  gRtTail = (gRtTail + 160) % RT_RING;
+
+  size_t f = 0;
+  for (size_t i = 0; i < 160; i++) {
+    int32_t a = src[i], b = src[i + 1];
+    for (int k = 0; k < 6; k++) {
+      int32_t v = a + ((b - a) * k) / 6;
+      v = (int32_t)(v * TTS_VOLUME);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      frame[f * 2] = v << 16;
+      frame[f * 2 + 1] = v << 16;
+      f++;
+    }
+  }
+  Speaker.write((uint8_t *)frame, f * 2 * sizeof(int32_t));
+}
+
+static bool rtSendJson(JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  return gWs.send(out);
+}
+
+// One conversation. Opens the socket, streams microphone up and audio down
+// until the user goes quiet, then tears everything down.
+static void realtimeSession() {
+  if (!gRtRing) {
+    gRtRing = (int16_t *)ps_malloc(RT_RING * sizeof(int16_t));
+    if (!gRtRing) {
+      logf("no PSRAM for the realtime ring");
+      return;
+    }
+  }
+  gRtHead = gRtTail = 0;
+  gRtTranscript = "";
+  gRtSawAudio = false;
+
+  setStatus(STATUS_WORKING);
+  oledShow("Nova", "Connecting...");
+
+  // setInsecure() is a no-op on ESP32 in this library: upgradeToSecuredConnection()
+  // only applies setInsecure on ESP8266, so without a CA the WiFiClientSecure it
+  // creates has no trust anchor and the handshake fails before the upgrade.
+  gWs.setCACert(OPENAI_ROOT_CA);
+  gWs.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+  gWs.onMessage(rtOnMessage);
+
+  String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
+  uint32_t t0 = millis();
+  if (!gWs.connect(url)) {
+    logf("realtime connect failed");
+    oledShow("Error", "Could not connect");
+    setStatus(STATUS_ERROR);
+    return;
+  }
+  logf("realtime connected in %lu ms", (unsigned long)(millis() - t0));
+
+  // GA session shape: formats are objects, and mu-law keeps this to ~8 KB/s
+  // each way instead of the 48 KB/s that pcm16 would need.
+  {
+    JsonDocument cfg;
+    cfg["type"] = "session.update";
+    JsonObject sess = cfg["session"].to<JsonObject>();
+    sess["type"] = "realtime";
+    sess["instructions"] = REALTIME_INSTRUCTIONS;
+    sess["output_modalities"].to<JsonArray>().add("audio");
+
+    JsonObject audio = sess["audio"].to<JsonObject>();
+    JsonObject in = audio["input"].to<JsonObject>();
+    in["format"]["type"] = "audio/pcmu";
+    JsonObject turn = in["turn_detection"].to<JsonObject>();
+    turn["type"] = "server_vad";
+    turn["silence_duration_ms"] = 400;
+
+    JsonObject out = audio["output"].to<JsonObject>();
+    out["format"]["type"] = "audio/pcmu";
+    out["voice"] = REALTIME_VOICE;
+    rtSendJson(cfg);
+  }
+
+  oledShow("Nova", "Listening...");
+  setStatus(STATUS_RECORDING);
+  emitEvent("state", "state", "realtime");
+
+  static int32_t raw[I2S_CHUNK_FRAMES];
+  static uint8_t ulaw[1024];
+  static char b64[1500];
+  size_t ulawLen = 0;
+
+  uint32_t start = millis();
+  uint32_t lastVoice = millis();
+  String shown;
+
+  while (gWs.available() && (millis() - start) < REALTIME_MAX_MS) {
+    gWs.poll();
+
+    // Draining the ring takes priority: a gap here is audible, a late
+    // microphone chunk is not.
+    if (rtAvailable() >= 161) {
+      rtPlayBlock();
+      lastVoice = millis();
+      if (gRtTranscript.length() && gRtTranscript != shown) {
+        shown = gRtTranscript;
+        oledShow("Nova", shown.c_str());
+      }
+      continue;
+    }
+
+    // No echo cancellation here, so only capture when nothing is playing -
+    // otherwise the server hears our own speaker and interrupts itself.
+    size_t bytes = I2S.readBytes((char *)raw, sizeof(raw));
+    size_t frames = bytes / sizeof(int32_t);
+
+    int32_t peak = 0;
+    for (size_t i = 0; i + 1 < frames; i += 2) {
+      // 24-bit -> 16-bit, high-passed, then 16 kHz -> 8 kHz by averaging pairs.
+      float x0 = (float)(raw[i] >> 8);
+      float y0 = HPF_ALPHA * (gHpfY1 + x0 - gHpfX1);
+      gHpfX1 = x0; gHpfY1 = y0;
+      float x1 = (float)(raw[i + 1] >> 8);
+      float y1 = HPF_ALPHA * (gHpfY1 + x1 - gHpfX1);
+      gHpfX1 = x1; gHpfY1 = y1;
+
+      int32_t v = (int32_t)(((y0 + y1) * 0.5f) * MIC_GAIN / 256.0f);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      int32_t mag = v < 0 ? -v : v;
+      if (mag > peak) peak = mag;
+
+      if (ulawLen < sizeof(ulaw)) ulaw[ulawLen++] = pcmToUlaw((int16_t)v);
+    }
+    if (peak > SPEECH_MIN_PEAK) lastVoice = millis();
+
+    if (ulawLen >= 800) {
+      size_t n = 0;
+      if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &n, ulaw, ulawLen) == 0) {
+        b64[n] = '\0';
+        JsonDocument msg;
+        msg["type"] = "input_audio_buffer.append";
+        msg["audio"] = b64;
+        rtSendJson(msg);
+      }
+      ulawLen = 0;
+    }
+
+    if ((millis() - lastVoice) > REALTIME_IDLE_MS) {
+      logf("realtime idle, closing");
+      break;
+    }
+    if (gButtonHeld) {
+      logf("button pressed, closing");
+      break;
+    }
+  }
+
+  gWs.close();
+  logf("realtime session ended after %lu ms%s",
+       (unsigned long)(millis() - start), gRtSawAudio ? "" : " (no audio received)");
+  if (gRtTranscript.length()) emitEvent("answer", "text", gRtTranscript.c_str());
+}
+#endif  // REALTIME_ENABLED
+
 // ---------------------------------------------------------------- button ---
 // Simple debounce: the level has to stay put for DEBOUNCE_MS before it counts.
 static const uint32_t DEBOUNCE_MS = 25;
@@ -1818,6 +2083,41 @@ void loop() {
   wifiPollScan();
 
   gButtonHeld = buttonPressedStable();
+
+#if REALTIME_ENABLED
+  if (gState == ST_LISTENING && (gWakeRequested || gButtonHeld)) {
+    gWakeRequested = false;
+    gState = ST_UPLOADING;  // stops the detector re-triggering mid-session
+
+    // ESP-SR saturates both cores; leaving it running costs the socket most of
+    // its throughput, and nothing needs detecting once a session is open.
+    sr_pause();
+    realtimeSession();
+    sr_resume();
+    sr_set_mode(SR_MODE_COMMAND);
+
+    gWakeRequested = false;
+    gState = ST_LISTENING;
+    setStatus(STATUS_IDLE);
+    emitEvent("state", "state", "ready");
+    return;
+  }
+  // Fall through to the shared housekeeping below rather than returning: the
+  // WiFi keepalive lives at the end of loop() and still needs to run.
+  oledTick();
+
+  static uint32_t rtWifiCheck = 0;
+  if (millis() - rtWifiCheck > 10000) {
+    rtWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      logf("wifi dropped, reconnecting");
+      WiFi.reconnect();
+    }
+  }
+  delay(5);
+  return;
+#endif
+
 
   // Edge-trigger the display so a finished answer stays on screen instead of
   // being redrawn (and reset to page 1) on every pass through loop().
