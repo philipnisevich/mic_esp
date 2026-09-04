@@ -84,7 +84,7 @@ static const uint32_t MIN_RECORD_MS = 300;   // ignore accidental taps
 // much pre-roll and the tail of "Nova" lands in the transcript - if you see
 // that, lower this first.
 static const uint32_t PREROLL_MS      = 300;
-static const uint32_t VAD_SILENCE_MS  = 800;   // quiet this long ends a take
+static const uint32_t VAD_SILENCE_MS  = 500;   // quiet this long ends a take
 static const uint32_t VAD_MIN_SPEECH_MS = 400; // ...but never before this much
 static const float    VAD_NOISE_MULT  = 3.0f;  // speech = this x the noise floor
 static const uint32_t VAD_MIN_LEVEL   = 250;   // absolute floor for a dead-quiet room
@@ -1437,6 +1437,12 @@ static bool speak(const char *text) {
   if (!gSpeakerReady || !text || !*text) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
 
+  // Pause detection for the whole call, not just playback. ESP-SR saturates
+  // both cores, and the TLS download measured only 46 KB/s against a 48 KB/s
+  // playback rate - slower than real time. Nothing needs detecting while the
+  // device is fetching and speaking its own reply.
+  sr_pause();
+
   JsonDocument req;
   req["model"] = TTS_MODEL;
   req["voice"] = TTS_VOICE;
@@ -1453,7 +1459,10 @@ static bool speak(const char *text) {
   http.setConnectTimeout(10000);
   http.setTimeout(30000);
   http.setReuse(false);
-  if (!http.begin(client, "https://api.openai.com/v1/audio/speech")) return false;
+  if (!http.begin(client, "https://api.openai.com/v1/audio/speech")) {
+    sr_resume();
+    return false;
+  }
   http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
   http.addHeader("Content-Type", "application/json");
 
@@ -1462,6 +1471,7 @@ static bool speak(const char *text) {
   if (code != HTTP_CODE_OK) {
     logf("tts http %d: %s", code, http.getString().substring(0, 120).c_str());
     http.end();
+    sr_resume();
     return false;
   }
 
@@ -1470,6 +1480,7 @@ static bool speak(const char *text) {
   size_t got = sink.length();
   if (got < 2) {
     logf("tts returned no audio");
+    sr_resume();
     return false;
   }
   // TTS rarely comes back near full scale, and at 3V3 the amplifier has ~8 dB
@@ -1491,15 +1502,16 @@ static bool speak(const char *text) {
     if (boost > 1.0f) gain = boost;
   }
 
-  logf("tts %u KB in %lu ms, playing %.1f s (peak %d, gain x%.2f)",
-       (unsigned)(got / 1024), (unsigned long)(millis() - t0),
+  uint32_t fetchMs = millis() - t0;
+  logf("tts %u KB in %lu ms (%lu KB/s), playing %.1f s (peak %d, gain x%.2f)",
+       (unsigned)(got / 1024), (unsigned long)fetchMs,
+       (unsigned long)(fetchMs ? (got / fetchMs) : 0),
        got / 2.0f / TTS_SAMPLE_RATE, (int)peak, gain);
 
   // ESP-SR runs its AFE and MultiNet continuously across both cores. Leaving it
   // running during playback means the feed task, the detect task and the
   // playback loop all contend for CPU and PSRAM bandwidth, which shows up as
   // dropouts. Nothing needs to be detected while we are talking anyway.
-  sr_pause();
   playPcm(gTtsBuf, got, gain);
   sr_resume();
   return true;
