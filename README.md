@@ -162,6 +162,39 @@ text. Replies longer than one screen paginate every 3.5 s with a `1/3` counter,
 and the last answer stays up until the next take. Set `OLED_HEIGHT` to 32 in
 `config.h` for the half-height modules.
 
+## Amplifier (MAX98357A)
+
+| MAX98357A | ESP32-S3 | Note |
+|---|---|---|
+| VIN | **3V3** | see below |
+| GND | GND | shared with the ESP32 |
+| DIN | GPIO 12 | `PIN_AMP_DIN` |
+| BCLK | GPIO 10 | `PIN_AMP_BCLK` |
+| LRC | GPIO 11 | `PIN_AMP_LRC` |
+| GAIN | floating | 9 dB; tie to GND for 12 dB if too quiet |
+| SD | VIN | forces enable and selects the left channel |
+
+Speaker across the two output pads. They are **bridge-tied** - both are driven,
+neither is ground, so never connect one side to GND.
+
+Three things here cost hours to find, all of which fail as pure silence with no
+error anywhere:
+
+- **Power.** The dev board's 5V pin was dead; VIN on 3V3 works. Nothing in
+  firmware can tell a disconnected amplifier from a working one, so measure VIN
+  to GND before debugging anything else.
+- **Sample rate.** The datasheet allows LRCLK of 8/16/32/44.1/48/88.2/96 kHz and
+  explicitly excludes 11.025/12/22.05/**24** kHz. OpenAI's `pcm` format is 24 kHz,
+  so the speaker path runs at 48 kHz with each sample written twice.
+- **I2S controller.** `I2SClass` defaults to `I2S_NUM_AUTO`. With the microphone
+  already holding a channel, the amplifier can land on the same controller and
+  share its clock. The mic is pinned to `I2S_NUM_0` and the amplifier to
+  `I2S_NUM_1`, and both ports are logged at boot.
+
+`AMP_PIN_SWEEP 1` in the sketch plays a distinct pitch through all six
+permutations of the three amplifier pins at boot, which identifies a miswire in
+one boot rather than six flash cycles.
+
 ## Serial protocol
 
 Two kinds of line come out of the board, so a bridge never has to guess:

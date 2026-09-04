@@ -58,9 +58,9 @@ static const int PIN_BUTTON = 0;
 // Play at 48 kHz instead and duplicate each source sample.
 static const uint32_t SPEAKER_SAMPLE_RATE = 48000;
 
-static const int PIN_AMP_BCLK = 15;
-static const int PIN_AMP_LRC  = 16;
-static const int PIN_AMP_DIN  = 7;
+static const int PIN_AMP_BCLK = 10;
+static const int PIN_AMP_LRC  = 11;
+static const int PIN_AMP_DIN  = 12;
 
 // SSD1306 OLED over I2C. These are the S3's default Wire pins.
 //   VCC -> 3V3, GND -> GND, SCL -> GPIO9, SDA -> GPIO8
@@ -1130,6 +1130,14 @@ static bool askOpenAI(const char *question, String &answer, bool research) {
 #if TTS_ENABLED
 static bool speakerBegin() {
   if (gSpeakerReady) return true;  // idempotent: a second call would orphan gTtsBuf
+
+  // Pin the amplifier to its own I2S controller. I2SClass defaults to
+  // I2S_NUM_AUTO, and since the microphone's RX channel is allocated first on
+  // I2S0, a TX channel would be placed on I2S0 as well - where it shares clock
+  // hardware with the 16 kHz microphone rather than running at our rate.
+  if (!Speaker.setPort(I2S_NUM_1)) {
+    logf("could not select I2S port 1 for the speaker");
+  }
   Speaker.setPins(PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, -1 /* no din */, -1);
   // Stereo with both slots carrying the same sample. The MAX98357A averages
   // L and R when SD is floating, so sending true mono would halve the level.
@@ -1152,6 +1160,7 @@ static bool speakerBegin() {
     return false;
   }
   gSpeakerReady = true;
+  logf("speaker on I2S port %d (mic is on port %d)", (int)Speaker.getPort(), (int)I2S.getPort());
   logf("speaker ok: bclk=%d lrc=%d din=%d @ %lu Hz, %u KB buffer",
        PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, (unsigned long)SPEAKER_SAMPLE_RATE,
        (unsigned)(gTtsCap / 1024));
@@ -1399,6 +1408,7 @@ void setup() {
     }
   }
 
+  I2S.setPort(I2S_NUM_0);  // keep the split deterministic: mic on 0, speaker on 1
   I2S.setPins(PIN_I2S_BCLK, PIN_I2S_WS, -1 /* no dout */, PIN_I2S_DIN, -1 /* no mclk */);
   if (!I2S.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT,
                  I2S_SLOT_MODE_MONO, (int8_t)MIC_SLOT)) {
