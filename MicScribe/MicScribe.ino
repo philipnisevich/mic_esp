@@ -1495,7 +1495,13 @@ static bool speak(const char *text) {
        (unsigned)(got / 1024), (unsigned long)(millis() - t0),
        got / 2.0f / TTS_SAMPLE_RATE, (int)peak, gain);
 
+  // ESP-SR runs its AFE and MultiNet continuously across both cores. Leaving it
+  // running during playback means the feed task, the detect task and the
+  // playback loop all contend for CPU and PSRAM bandwidth, which shows up as
+  // dropouts. Nothing needs to be detected while we are talking anyway.
+  sr_pause();
   playPcm(gTtsBuf, got, gain);
+  sr_resume();
   return true;
 }
 #endif  // TTS_ENABLED
@@ -1685,6 +1691,7 @@ void setup() {
       playTone(1000, 400);
       delay(150);
     }
+    // (SR is not running yet at this point in setup, so no pause is needed.)
     logf("test tone done in %lu ms (expected ~1650 ms)",
          (unsigned long)(millis() - toneStart));
   }
