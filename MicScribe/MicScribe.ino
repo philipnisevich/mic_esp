@@ -762,8 +762,24 @@ static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
 #if REALTIME_ENABLED
   // The realtime session reads I2S itself, so this callback only has to keep
   // feeding the wake-word detector. No capture buffers, no VAD, no pre-roll.
+  // Report the level occasionally: without it there is no way to tell a dead
+  // microphone from a detector that simply is not firing.
   (void)pcm16;
-  (void)level;
+  {
+    static uint32_t peak = 0, samples = 0, lastReport = 0;
+    if (level > peak) peak = level;
+    samples += n;
+    uint32_t now = millis();
+    if (lastReport == 0) lastReport = now;
+    if (now - lastReport >= 5000) {
+      logf("mic: peak=%lu over %lu ms (noise floor %d)",
+           (unsigned long)peak, (unsigned long)(now - lastReport), (int)gNoiseFloor);
+      peak = 0;
+      samples = 0;
+      lastReport = now;
+    }
+    gNoiseFloor = gNoiseFloor * 0.98f + (float)level * 0.02f;
+  }
   return;
 #else
   uint32_t chunkMs = (uint32_t)((n * 1000) / SAMPLE_RATE);
@@ -1669,6 +1685,10 @@ static const uint8_t RT_INTENT_STAY    = 2;
 static volatile uint8_t gRtIntent = RT_INTENT_UNKNOWN;
 static volatile bool gRtStopRequested = false;  // you said stop / shut up / etc.
 static String gRtCallId;
+// A search the model asked for, picked up by the session loop.
+static volatile bool gRtSearchPending = false;
+static String gRtSearchQuery;
+static String gRtSearchCallId;
 
 static inline size_t rtAvailable() {
   size_t h = gRtHead, t = gRtTail;
@@ -1734,6 +1754,7 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
   filter["item"]["type"] = true;
   filter["item"]["name"] = true;
   filter["item"]["call_id"] = true;
+  filter["item"]["arguments"] = true;
   filter["error"]["message"] = true;
 
   JsonDocument doc;
@@ -1797,8 +1818,11 @@ static void rtOnMessage(websockets::WebsocketsMessage msg) {
     if (!strcmp(itemType, "function_call")) {
       const char *name = doc["item"]["name"] | "";
       gRtCallId = (const char *)(doc["item"]["call_id"] | "");
-      if (!strcmp(name, "end_conversation")) gRtIntent = RT_INTENT_END;
-      else if (!strcmp(name, "stay_open"))   gRtIntent = RT_INTENT_STAY;
+      if (!strcmp(name, "web_search")) {
+        gRtSearchCallId = gRtCallId;
+        gRtSearchQuery = (const char *)(doc["item"]["arguments"] | "");
+        gRtSearchPending = true;
+      }
     }
 
   } else if (!strcmp(type, "conversation.item.input_audio_transcription.completed")) {
@@ -1881,6 +1905,15 @@ static void rtPlayTaskFn(void *arg) {
   vTaskDelete(NULL);
 }
 
+// The model emits no audio on a tool turn, so without this the device goes
+// mute for the whole search. A local chime costs nothing and is what every
+// voice assistant does here.
+static void rtThinkingCue() {
+  playTone(880, 90);
+  delay(60);
+  playTone(1175, 90);
+}
+
 static bool rtSendJson(JsonDocument &doc) {
   String out;
   serializeJson(doc, out);
@@ -1889,42 +1922,12 @@ static bool rtSendJson(JsonDocument &doc) {
 
 // One conversation. Opens the socket, streams microphone up and audio down
 // until the user goes quiet, then tears everything down.
-static void realtimeSession() {
-  if (!gRtRing) {
-    gRtRing = (int16_t *)ps_malloc(RT_RING * sizeof(int16_t));
-    if (!gRtRing) {
-      logf("no PSRAM for the realtime ring");
-      return;
-    }
-  }
-  gRtHead = gRtTail = 0;
-  gRtTranscript = "";
-  gRtSawAudio = false;
-  gRtRxBytes = gRtTxBytes = gRtPlayed = gRtEvents = gRtDropped = 0;
-  gRtResponseDone = false;
-  gRtTurnText = "";
-  gRtTurnRx = 0;
-  gRtIntent = RT_INTENT_UNKNOWN;
-  gRtStopRequested = false;
-  gRtCallId = "";
-
-  setStatus(STATUS_WORKING);
-  oledShow("Nova", "Connecting...");
-
-  // setInsecure() is a no-op on ESP32 in this library: upgradeToSecuredConnection()
-  // only applies setInsecure on ESP8266, so without a CA the WiFiClientSecure it
-  // creates has no trust anchor and the handshake fails before the upgrade.
-  logf("heap before connect: free=%u largest=%u",
-       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-
-  // The TLS probe that used to live here confirmed transport is fine and the
-  // failures are in the websocket upgrade, so it is gone: opening and tearing
-  // down a full TLS session immediately before the real one only fragments the
-  // heap at the worst moment.
-
+// Open the socket and configure the session. Used for the initial connect and
+// again after a web_search, which closes the socket so only one TLS session
+// exists at a time - two do not fit in the internal heap.
+static bool rtConnectAndConfigure() {
   String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
   uint32_t t0 = millis();
-
   // Configure exactly once for the lifetime of the program. addHeader() appends
   // to a vector that WebsocketsClient::operator= does not assign, so neither a
   // second call nor `gWs = WebsocketsClient()` clears it - headers accumulate
@@ -1964,9 +1967,7 @@ static void realtimeSession() {
       logf("plain TLS also failed (%d) %s - transport problem", code, err);
     }
     logf("realtime connect failed after 3 attempts");
-    oledShow("Error", "Could not connect");
-    setStatus(STATUS_ERROR);
-    return;
+    return false;
   }
   logf("realtime connected in %lu ms", (unsigned long)(millis() - t0));
 
@@ -1980,10 +1981,27 @@ static void realtimeSession() {
     sess["instructions"] = REALTIME_INSTRUCTIONS;
     sess["output_modalities"].to<JsonArray>().add("audio");
 
-    // No tools here. Registering them with tool_choice "required" makes the
-    // model emit the tool call INSTEAD of speech - measured against the live
-    // API: 0 bytes of audio with "required", 96 KB with "auto" but then it
-    // never calls the tool. Turn intent is judged locally instead.
+    // One tool, chosen automatically. "required" would make the model emit a
+    // call instead of speech on every turn; with "auto" and a tool it actually
+    // needs, it calls only for current facts and speaks directly otherwise -
+    // verified against the live API on "what day is it" (calls) versus "what
+    // is a Roth IRA" (does not).
+    sess["tool_choice"] = "auto";
+    JsonArray tools = sess["tools"].to<JsonArray>();
+    JsonObject search = tools.add<JsonObject>();
+    search["type"] = "function";
+    search["name"] = "web_search";
+    search["description"] =
+      "Look up current information: today's date, weather, news, prices, scores, "
+      "schedules, or anything that changes over time. Use it whenever you are not "
+      "certain of a current fact.";
+    JsonObject params = search["parameters"].to<JsonObject>();
+    params["type"] = "object";
+    JsonObject props = params["properties"].to<JsonObject>();
+    props["query"]["type"] = "string";
+    props["query"]["description"] = "What to search for";
+    params["required"].to<JsonArray>().add("query");
+
 
     JsonObject audio = sess["audio"].to<JsonObject>();
     JsonObject in = audio["input"].to<JsonObject>();
@@ -1999,6 +2017,52 @@ static void realtimeSession() {
     out["format"]["rate"] = RT_RX_RATE;
     out["voice"] = REALTIME_VOICE;
     rtSendJson(cfg);
+  }
+
+  return true;
+}
+
+static void realtimeSession() {
+  if (!gRtRing) {
+    gRtRing = (int16_t *)ps_malloc(RT_RING * sizeof(int16_t));
+    if (!gRtRing) {
+      logf("no PSRAM for the realtime ring");
+      return;
+    }
+  }
+  gRtHead = gRtTail = 0;
+  gRtTranscript = "";
+  gRtSawAudio = false;
+  gRtRxBytes = gRtTxBytes = gRtPlayed = gRtEvents = gRtDropped = 0;
+  gRtResponseDone = false;
+  gRtTurnText = "";
+  gRtTurnRx = 0;
+  gRtIntent = RT_INTENT_UNKNOWN;
+  gRtStopRequested = false;
+  gRtCallId = "";
+  gRtSearchPending = false;
+  gRtSearchQuery = "";
+  gRtSearchCallId = "";
+
+  setStatus(STATUS_WORKING);
+  oledShow("Nova", "Connecting...");
+
+  // setInsecure() is a no-op on ESP32 in this library: upgradeToSecuredConnection()
+  // only applies setInsecure on ESP8266, so without a CA the WiFiClientSecure it
+  // creates has no trust anchor and the handshake fails before the upgrade.
+
+  // The TLS probe that used to live here confirmed transport is fine and the
+  // failures are in the websocket upgrade, so it is gone: opening and tearing
+  // down a full TLS session immediately before the real one only fragments the
+  // heap at the worst moment.
+
+  String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
+  uint32_t t0 = millis();
+
+  if (!rtConnectAndConfigure()) {
+    oledShow("Error", "Could not connect");
+    setStatus(STATUS_ERROR);
+    return;
   }
 
   // The wake phrase is still in the I2S buffer at this point. Throw it away,
@@ -2094,6 +2158,71 @@ static void realtimeSession() {
     // A finished turn with the ring drained means the reply has been spoken.
     // End there unless it asked a question, in which case stay open just long
     // enough for an answer.
+    if (gRtSearchPending) {
+      gRtSearchPending = false;
+
+      // arguments arrive as a JSON string, not an object
+      String query;
+      {
+        JsonDocument args;
+        if (!deserializeJson(args, gRtSearchQuery)) {
+          query = (const char *)(args["query"] | "");
+        }
+      }
+      if (!query.length()) query = gRtSearchQuery;
+
+      logf("search: %s", query.c_str());
+      oledShow("Searching", query.c_str());
+      rtThinkingCue();
+
+      // Close the socket for the duration of the search. Two TLS sessions do
+      // not fit: with the websocket open, the search handshake fails with
+      // "SSL - Memory allocation failed" at ~31 KB largest free block, every
+      // time. Reconnecting costs ~2.3 s and is the price of a working lookup.
+      gWs.close();
+      delay(50);
+
+      String result;
+      uint32_t s0 = millis();
+      bool ok = askOpenAI(query.c_str(), result, true);
+      logf("search %s in %lu ms: %s", ok ? "ok" : "FAILED",
+           (unsigned long)(millis() - s0),
+           ok ? result.substring(0, 100).c_str() : "");
+
+      if (!ok || !result.length()) {
+        result = "The lookup failed.";
+      }
+      stripLinks(result);
+
+      if (!rtConnectAndConfigure()) {
+        logf("could not reconnect after the search");
+        break;
+      }
+
+      // The reconnect is a fresh session, so the tool call it was answering is
+      // gone. Restate the exchange as a plain turn instead.
+      String prompt = "I asked: " + query +
+                      "\nA search returned: " + result +
+                      "\nAnswer me in one or two short spoken sentences using that.";
+      JsonDocument item;
+      item["type"] = "conversation.item.create";
+      JsonObject msg = item["item"].to<JsonObject>();
+      msg["type"] = "message";
+      msg["role"] = "user";
+      JsonObject content = msg["content"].to<JsonArray>().add<JsonObject>();
+      content["type"] = "input_text";
+      content["text"] = prompt;
+      rtSendJson(item);
+
+      JsonDocument go;
+      go["type"] = "response.create";
+      rtSendJson(go);
+
+      lastVoice = millis();
+      oledShow("Nova", "...");
+      continue;
+    }
+
     if (gRtStopRequested) {
       logf("stop requested, closing");
       break;
@@ -2370,11 +2499,19 @@ void loop() {
     gWakeRequested = false;
     gState = ST_UPLOADING;  // stops the detector re-triggering mid-session
 
-    // sr_pause(), not sr_stop(). Tearing ESP-SR down from loop() while its feed
-    // task may be inside our fill callback corrupts the heap - seen as
-    // "CORRUPT HEAP: Bad tail" in PSRAM on every wake. It is also unnecessary:
-    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL is 4096, so mbedtls's large buffers
-    // already come from PSRAM rather than the internal block.
+    // Pause first, then stop. ESP-SR's models stay resident through a pause,
+    // leaving only ~31 KB contiguous - not enough for a second TLS handshake,
+    // so a web_search during a session failed with "SSL - Memory allocation
+    // failed". Stopping frees them for the whole session.
+    //
+    // An earlier attempt called sr_stop() straight from loop() and corrupted
+    // the heap, because the feed task could be inside our fill callback.
+    // Pausing parks that task on its event group first, which makes the
+    // teardown safe.
+    // Pause only. sr_stop() frees the heap a concurrent TLS handshake needs,
+    // but wake detection stopped working both times it was enabled, and no
+    // mechanism was ever established - so the search closes the socket instead,
+    // and ESP-SR is left alone.
     sr_pause();
     realtimeSession();
     sr_resume();
