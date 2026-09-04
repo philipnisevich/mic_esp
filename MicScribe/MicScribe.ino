@@ -49,6 +49,15 @@ static const int PIN_BUTTON = 0;
 // MAX98357A I2S amplifier (output). Uses the S3's second I2S controller, so it
 // runs alongside the microphone rather than competing with it.
 //   VIN -> 5V, GND -> GND, GAIN and SD left floating
+// One-shot diagnostic: sweep every pin permutation at boot. Set to 0 for normal use.
+#define AMP_PIN_SWEEP 0
+
+// The MAX98357A supports LRCLK of 8/16/32/44.1/48/88.2/96 kHz ONLY. Its
+// datasheet explicitly excludes 24 kHz - which is exactly what OpenAI's pcm
+// format returns, and why the amp sat silent through every other experiment.
+// Play at 48 kHz instead and duplicate each source sample.
+static const uint32_t SPEAKER_SAMPLE_RATE = 48000;
+
 static const int PIN_AMP_BCLK = 15;
 static const int PIN_AMP_LRC  = 16;
 static const int PIN_AMP_DIN  = 7;
@@ -1120,10 +1129,17 @@ static bool askOpenAI(const char *question, String &answer, bool research) {
 // ------------------------------------------------------------------ tts ----
 #if TTS_ENABLED
 static bool speakerBegin() {
+  if (gSpeakerReady) return true;  // idempotent: a second call would orphan gTtsBuf
   Speaker.setPins(PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, -1 /* no din */, -1);
   // Stereo with both slots carrying the same sample. The MAX98357A averages
   // L and R when SD is floating, so sending true mono would halve the level.
-  if (!Speaker.begin(I2S_MODE_STD, TTS_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
+  // 32-bit slots, not 16. The audio is 16-bit, but the slot width sets the bit
+  // clock: 16-bit stereo gives BCLK = 32 x LRCLK, and plenty of MAX98357A parts
+  // fail to lock their clock recovery at 32fs and then output silence with no
+  // other symptom. 32-bit slots give the 64fs that working examples all use;
+  // samples are left-justified into the top half, which the amp ignores below
+  // its resolution anyway.
+  if (!Speaker.begin(I2S_MODE_STD, SPEAKER_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
     logf("speaker I2S init failed - is another peripheral using bclk=%d ws=%d?",
          PIN_AMP_BCLK, PIN_AMP_LRC);
     return false;
@@ -1136,8 +1152,8 @@ static bool speakerBegin() {
     return false;
   }
   gSpeakerReady = true;
-  logf("speaker ok: bclk=%d lrc=%d din=%d @ %d Hz, %u KB buffer",
-       PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, TTS_SAMPLE_RATE,
+  logf("speaker ok: bclk=%d lrc=%d din=%d @ %lu Hz, %u KB buffer",
+       PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, (unsigned long)SPEAKER_SAMPLE_RATE,
        (unsigned)(gTtsCap / 1024));
   return true;
 }
@@ -1174,21 +1190,25 @@ private:
 static void playPcm(const uint8_t *pcm, size_t bytes) {
   const int16_t *src = (const int16_t *)pcm;
   size_t total = bytes / sizeof(int16_t);
-  static int16_t frame[256 * 2];
+  static int32_t frame[256 * 2];
 
   size_t i = 0;
   while (i < total) {
     size_t n = 0;
-    while (n < 256 && i < total) {
+    while (n < 254 && i < total) {
       int32_t v = (int32_t)(src[i++] * TTS_VOLUME);
       if (v > 32767) v = 32767;
       if (v < -32768) v = -32768;
-      frame[n * 2] = (int16_t)v;
-      frame[n * 2 + 1] = (int16_t)v;
+      // Each 24 kHz sample becomes two 48 kHz frames, both slots identical.
+      frame[n * 2] = v << 16;
+      frame[n * 2 + 1] = v << 16;
+      n++;
+      frame[n * 2] = v << 16;
+      frame[n * 2 + 1] = v << 16;
       n++;
     }
     // Blocking write: the DMA queue paces this loop for us.
-    Speaker.write((uint8_t *)frame, n * 2 * sizeof(int16_t));
+    Speaker.write((uint8_t *)frame, n * 2 * sizeof(int32_t));
   }
 }
 
@@ -1196,22 +1216,22 @@ static void playPcm(const uint8_t *pcm, size_t bytes) {
 // TTS path, so if this is silent the problem is wiring, power or the SD pin.
 static void playTone(uint16_t freq, uint16_t ms) {
   if (!gSpeakerReady) return;
-  const size_t total = (size_t)TTS_SAMPLE_RATE * ms / 1000;
-  static int16_t frame[256 * 2];
+  const size_t total = (size_t)SPEAKER_SAMPLE_RATE * ms / 1000;
+  static int32_t frame[256 * 2];
   size_t i = 0;
   while (i < total) {
     size_t c = 0;
     while (c < 256 && i < total) {
-      float t = (float)i / (float)TTS_SAMPLE_RATE;
+      float t = (float)i / (float)SPEAKER_SAMPLE_RATE;
       int32_t v = (int32_t)(sinf(2.0f * PI * freq * t) * 26000.0f * TTS_VOLUME);
       if (v > 32767) v = 32767;
       if (v < -32768) v = -32768;
-      frame[c * 2] = (int16_t)v;
-      frame[c * 2 + 1] = (int16_t)v;
+      frame[c * 2] = v << 16;      // left-justify into the 32-bit slot
+      frame[c * 2 + 1] = v << 16;
       c++;
       i++;
     }
-    Speaker.write((uint8_t *)frame, c * 2 * sizeof(int16_t));
+    Speaker.write((uint8_t *)frame, c * 2 * sizeof(int32_t));
   }
 }
 
@@ -1392,9 +1412,38 @@ void setup() {
        PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DIN, (unsigned long)SAMPLE_RATE);
 
 #if TTS_ENABLED
+#if AMP_PIN_SWEEP
+  speakerBegin();  // allocates the shared buffer before the sweep re-inits I2S
+  // The datasheet says our clocking is legal and the wiring reads correct, so
+  // the remaining candidate is a pin mismatch. Rather than guess, walk every
+  // permutation of the three pins and play a distinct pitch on each. Whichever
+  // beep is audible names the true wiring.
+  {
+    const int pins[3] = {PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN};
+    const int perm[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    const uint16_t pitch[6] = {500, 700, 900, 1100, 1300, 1500};
+
+    for (int i = 0; i < 6; i++) {
+      int bclk = pins[perm[i][0]], lrc = pins[perm[i][1]], din = pins[perm[i][2]];
+      Speaker.end();
+      Speaker.setPins(bclk, lrc, din, -1, -1);
+      if (!Speaker.begin(I2S_MODE_STD, SPEAKER_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
+        logf("sweep %d: begin failed for bclk=%d lrc=%d din=%d", i + 1, bclk, lrc, din);
+        continue;
+      }
+      gSpeakerReady = true;
+      logf("sweep %d/6: %u Hz  bclk=%d lrc=%d din=%d", i + 1, (unsigned)pitch[i], bclk, lrc, din);
+      playTone(pitch[i], 500);
+      delay(400);
+    }
+    // Leave it on the configured pins for normal operation.
+    Speaker.end();
+    Speaker.setPins(PIN_AMP_BCLK, PIN_AMP_LRC, PIN_AMP_DIN, -1, -1);
+    gSpeakerReady = Speaker.begin(I2S_MODE_STD, SPEAKER_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
+    logf("sweep done - report which pitch you heard, if any");
+  }
+#else
   if (speakerBegin()) {
-    // Loud, long and repeated: this is the isolation test for the amp, so it
-    // should be impossible to miss if the hardware path works at all.
     uint32_t toneStart = millis();
     for (int i = 0; i < 3; i++) {
       playTone(1000, 400);
@@ -1403,6 +1452,7 @@ void setup() {
     logf("test tone done in %lu ms (expected ~1650 ms)",
          (unsigned long)(millis() - toneStart));
   }
+#endif
 #endif
 
   connectWiFi();
