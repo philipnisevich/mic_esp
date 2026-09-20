@@ -1,5 +1,10 @@
 # MicScribe
 
+> **Looking for Nova on this hardware?** See [`NovaLive/`](NovaLive/README.md):
+> GPT-Live-1 on the ESP32 over WebRTC, with Nova's backend (Claude + Composio)
+> doing the thinking. It's a separate ESP-IDF firmware for the same wiring.
+> MicScribe below is unchanged.
+
 Push-to-talk speech-to-text that runs entirely on an ESP32-S3. Hold a button,
 talk into an INMP441, let go — the board records the audio, uploads it to the
 ElevenLabs Scribe API itself, and prints the transcript out of the serial port.

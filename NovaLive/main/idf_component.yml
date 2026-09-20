@@ -1,0 +1,23 @@
+dependencies:
+  idf:
+    version: ">=5.4.4"
+  espressif/esp_peer:
+    version: "*"
+    override_path: ../../third_party/esp-webrtc-solution/components/esp_peer
+  tempotian/av_render:
+    version: "*"
+    override_path: ../../third_party/esp-webrtc-solution/components/av_render
+  tempotian/media_lib_utils:
+    version: "*"
+    override_path: ../../third_party/esp-webrtc-solution/components/media_lib_utils
+  esp_webrtc:
+    version: "*"
+    path: ../../third_party/esp-webrtc-solution/components/esp_webrtc
+  espressif/esp_capture: "~1.0"
+  espressif/esp_audio_codec: "~2.5"
+  espressif/esp-sr: "^2.4.0"
+  espressif/cjson: "*"
+  webrtc_utils:
+    version: "*"
+    path: ../../third_party/esp-webrtc-solution/components/webrtc_utils
+  espressif/led_strip: "^3.0.0"

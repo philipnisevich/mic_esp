@@ -28,6 +28,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ArduinoWebsockets.h>
+#include "mbedtls/base64.h"
 
 #include "config.h"
 
@@ -757,6 +759,29 @@ static void endCapture(const char *reason) {
 // audio buffers are written, which is what keeps the state machine race-free.
 static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
   if (n == 0) return;
+#if REALTIME_ENABLED
+  // The realtime session reads I2S itself, so this callback only has to keep
+  // feeding the wake-word detector. No capture buffers, no VAD, no pre-roll.
+  // Report the level occasionally: without it there is no way to tell a dead
+  // microphone from a detector that simply is not firing.
+  (void)pcm16;
+  {
+    static uint32_t peak = 0, samples = 0, lastReport = 0;
+    if (level > peak) peak = level;
+    samples += n;
+    uint32_t now = millis();
+    if (lastReport == 0) lastReport = now;
+    if (now - lastReport >= 5000) {
+      logf("mic: peak=%lu over %lu ms (noise floor %d)",
+           (unsigned long)peak, (unsigned long)(now - lastReport), (int)gNoiseFloor);
+      peak = 0;
+      samples = 0;
+      lastReport = now;
+    }
+    gNoiseFloor = gNoiseFloor * 0.98f + (float)level * 0.02f;
+  }
+  return;
+#else
   uint32_t chunkMs = (uint32_t)((n * 1000) / SAMPLE_RATE);
 
   uint8_t st = gState;
@@ -801,6 +826,7 @@ static void processAudio(const int16_t *pcm16, size_t n, uint32_t level) {
   }
 
   if (gSamples >= gMaxSamples) endCapture("length limit");
+#endif  // REALTIME_ENABLED
 }
 
 // ESP-SR pulls audio through this instead of reading I2S itself, which lets a
@@ -1417,13 +1443,22 @@ static bool speakerBegin() {
          PIN_AMP_BCLK, PIN_AMP_LRC);
     return false;
   }
+#if REALTIME_ENABLED
+  // The one-shot TTS path is unused here; 1.17 MB of PSRAM is better spent on
+  // the receive ring.
+  gTtsCap = 0;
+  gTtsBuf = nullptr;
+#else
   gTtsCap = (size_t)TTS_SAMPLE_RATE * 2 * TTS_MAX_SECONDS;
   gTtsBuf = (uint8_t *)ps_malloc(gTtsCap);
+#endif
+#if !REALTIME_ENABLED
   if (!gTtsBuf) {
     gTtsCap = 0;
     logf("no PSRAM for the tts buffer");
     return false;
   }
+#endif
   gSpeakerReady = true;
   logf("speaker on I2S port %d (mic is on port %d)", (int)Speaker.getPort(), (int)I2S.getPort());
   logf("speaker ok: bclk=%d lrc=%d din=%d @ %lu Hz, %u KB buffer",
@@ -1606,6 +1641,646 @@ static bool speak(const char *text) {
   return true;
 }
 #endif  // TTS_ENABLED
+
+
+// ------------------------------------------------------------- realtime ----
+#if REALTIME_ENABLED
+using namespace websockets;
+
+static WebsocketsClient gWs;
+
+// Decoded 8 kHz audio waiting to be played. The socket callback fills it and
+// the session loop drains it in small blocks, so neither starves the other.
+// Playback runs at 24 kHz, not the 8 kHz of the uplink: mu-law caps audio
+// bandwidth at 4 kHz, which is telephone quality and audibly thin. The API
+// accepts different formats per direction, so the microphone stays cheap while
+// the reply comes back at full rate.
+static const uint32_t RT_RX_RATE = 24000;
+
+// Playback used to start after a single 20 ms block, so the DMA drained faster
+// than the socket filled it and the first second glitched. Wait for a cushion
+// before the first block of a turn; once running, the stream stays ahead.
+static const size_t RT_PREBUFFER = (RT_RX_RATE * REALTIME_PREBUFFER_MS) / 1000;
+
+// Audio arrives faster than it plays, so the ring holds a whole reply. 30 s at
+// 24 kHz is 1.44 MB of PSRAM.
+static const size_t RT_RING = 24000 * 30;
+static int16_t *gRtRing = nullptr;
+static volatile size_t gRtHead = 0, gRtTail = 0;
+static String gRtTranscript;
+static bool gRtSawAudio = false;
+static uint32_t gRtRxBytes = 0;   // mu-law received from the API
+static uint32_t gRtTxBytes = 0;   // mu-law sent from the microphone
+static uint32_t gRtPlayed = 0;    // samples actually written to I2S
+static uint32_t gRtEvents = 0;    // websocket messages seen
+static uint32_t gRtDropped = 0;   // ring overruns
+static volatile bool gRtResponseDone = false;  // the model finished a turn
+static String gRtTurnText;        // transcript of just the current turn
+static volatile uint32_t gRtTurnRx = 0;  // audio bytes in the current turn
+
+// What the model signalled about this turn, via a forced tool call.
+static const uint8_t RT_INTENT_UNKNOWN = 0;
+static const uint8_t RT_INTENT_END     = 1;
+static const uint8_t RT_INTENT_STAY    = 2;
+static volatile uint8_t gRtIntent = RT_INTENT_UNKNOWN;
+static volatile bool gRtStopRequested = false;  // you said stop / shut up / etc.
+static String gRtCallId;
+// A search the model asked for, picked up by the session loop.
+static volatile bool gRtSearchPending = false;
+static String gRtSearchQuery;
+static String gRtSearchCallId;
+
+static inline size_t rtAvailable() {
+  size_t h = gRtHead, t = gRtTail;
+  return (h >= t) ? (h - t) : (RT_RING - t + h);
+}
+
+// G.711 mu-law. Both directions are a handful of shifts - no table needed.
+static inline int16_t ulawToPcm(uint8_t u) {
+  u = ~u;
+  int16_t t = ((u & 0x0F) << 3) + 0x84;
+  t <<= ((unsigned)u & 0x70) >> 4;
+  return (u & 0x80) ? (0x84 - t) : (t - 0x84);
+}
+
+static inline uint8_t pcmToUlaw(int16_t pcm) {
+  const int16_t BIAS = 0x84, CLIP = 32635;
+  int sign = (pcm >> 8) & 0x80;
+  if (sign) pcm = -pcm;
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += BIAS;
+  int exponent = 7;
+  for (int mask = 0x4000; (pcm & mask) == 0 && exponent > 0; exponent--, mask >>= 1) {}
+  int mantissa = (pcm >> (exponent + 3)) & 0x0F;
+  return (uint8_t)~(sign | (exponent << 4) | mantissa);
+}
+
+// "stop", "shut up", "never mind" and friends end the session. Matched only
+// against a short whole utterance, so "when does the bus stop running" is safe.
+static bool isStopPhrase(const String &raw) {
+  static const char *PHRASES[] = {
+    "stop", "stop it", "shut up", "be quiet", "quiet",
+    "turn off", "turn it off", "shut down", "shut off",
+    "never mind", "nevermind", "cancel", "forget it",
+    "that is all", "thats all", "that's all", "we are done", "were done",
+    "goodbye", "good bye", "bye", "bye bye", "exit", "end",
+  };
+
+  String t;
+  for (int i = 0; i < (int)raw.length(); i++) {
+    char c = raw[i];
+    if (isalnum((unsigned char)c) || c == ' ' || c == '\'') t += (char)tolower((unsigned char)c);
+    else if (c == ',' || c == '.' || c == '!' || c == '?') t += ' ';
+  }
+  t.trim();
+  while (t.indexOf("  ") >= 0) t.replace("  ", " ");
+  if (t.length() == 0 || t.length() > 24) return false;  // long sentences are not commands
+
+  for (size_t i = 0; i < sizeof(PHRASES) / sizeof(PHRASES[0]); i++) {
+    if (t == PHRASES[i]) return true;
+    String withPlease = String(PHRASES[i]) + " please";
+    if (t == withPlease) return true;
+  }
+  return false;
+}
+
+static void rtOnMessage(websockets::WebsocketsMessage msg) {
+  // Only two fields matter on the hot path, and audio frames are several KB,
+  // so filter rather than materialise the whole event.
+  JsonDocument filter;
+  filter["type"] = true;
+  filter["delta"] = true;
+  filter["transcript"] = true;
+  filter["item"]["type"] = true;
+  filter["item"]["name"] = true;
+  filter["item"]["call_id"] = true;
+  filter["item"]["arguments"] = true;
+  filter["error"]["message"] = true;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, msg.data(), DeserializationOption::Filter(filter))) return;
+  gRtEvents++;
+
+  const char *type = doc["type"] | "";
+
+  if (!strcmp(type, "response.output_audio.delta")) {
+    const char *b64 = doc["delta"] | "";
+    size_t b64Len = strlen(b64);
+    if (!b64Len || !gRtRing) return;
+
+    // Sized for a whole delta, in PSRAM. 24 kHz PCM chunks are several times
+    // larger than the 8 kHz mu-law ones this started with, and a too-small
+    // buffer makes mbedtls_base64_decode fail and drop the chunk entirely -
+    // which showed up as 2400 bytes of audio for a full spoken reply.
+    static uint8_t *decoded = nullptr;
+    static size_t decodedCap = 0;
+    size_t needed = (b64Len / 4) * 3 + 4;
+    if (needed > decodedCap) {
+      uint8_t *grown = (uint8_t *)ps_realloc(decoded, needed);
+      if (!grown) {
+        gRtDropped++;
+        return;
+      }
+      decoded = grown;
+      decodedCap = needed;
+    }
+
+    size_t outLen = 0;
+    if (mbedtls_base64_decode(decoded, decodedCap, &outLen,
+                              (const unsigned char *)b64, b64Len) != 0) {
+      gRtDropped++;
+      return;
+    }
+    gRtRxBytes += outLen;
+    gRtTurnRx += outLen;
+    // Little-endian signed 16-bit, straight from the wire.
+    for (size_t i = 0; i + 1 < outLen; i += 2) {
+      size_t next = (gRtHead + 1) % RT_RING;
+      if (next == gRtTail) { gRtDropped++; break; }  // ring full
+      gRtRing[gRtHead] = (int16_t)((uint16_t)decoded[i] | ((uint16_t)decoded[i + 1] << 8));
+      gRtHead = next;
+    }
+    gRtSawAudio = true;
+
+  } else if (!strcmp(type, "response.output_audio_transcript.delta")) {
+    const char *d = doc["delta"] | "";
+    gRtTranscript += d;
+    gRtTurnText += d;
+
+  } else if (!strcmp(type, "response.created")) {
+    gRtTurnText = "";
+    gRtTurnRx = 0;
+    gRtResponseDone = false;
+    gRtIntent = RT_INTENT_UNKNOWN;
+
+  } else if (!strcmp(type, "response.output_item.done")) {
+    const char *itemType = doc["item"]["type"] | "";
+    if (!strcmp(itemType, "function_call")) {
+      const char *name = doc["item"]["name"] | "";
+      gRtCallId = (const char *)(doc["item"]["call_id"] | "");
+      if (!strcmp(name, "web_search")) {
+        gRtSearchCallId = gRtCallId;
+        gRtSearchQuery = (const char *)(doc["item"]["arguments"] | "");
+        gRtSearchPending = true;
+      }
+    }
+
+  } else if (!strcmp(type, "conversation.item.input_audio_transcription.completed")) {
+    String heard = (const char *)(doc["transcript"] | "");
+    if (isStopPhrase(heard)) {
+      logf("heard \"%s\" - ending", heard.c_str());
+      gRtStopRequested = true;
+    }
+
+  } else if (!strcmp(type, "response.done")) {
+    gRtResponseDone = true;
+
+  } else if (!strcmp(type, "error")) {
+    logf("realtime error: %s", (const char *)(doc["error"]["message"] | "unknown"));
+  }
+}
+
+// Pop one 20 ms block and play it. 8 kHz in, 48 kHz out, linearly interpolated
+// so the amplifier sees the rate it actually supports.
+static void rtPlayBlock() {
+  static int16_t src[481];
+  // 7.7 KB, and internal RAM is exactly what the TLS handshake is short of.
+  static int32_t *frame = nullptr;
+  if (!frame) {
+    frame = (int32_t *)ps_malloc(160 * 6 * 2 * sizeof(int32_t));
+    if (!frame) return;
+  }
+
+  size_t have = rtAvailable();
+  if (have < 481) return;
+
+  for (size_t i = 0; i < 481; i++) {
+    src[i] = gRtRing[(gRtTail + i) % RT_RING];
+  }
+  gRtTail = (gRtTail + 480) % RT_RING;
+
+  // 480 samples at 24 kHz -> 960 frames at 48 kHz, 20 ms either way.
+  size_t f = 0;
+  for (size_t i = 0; i < 480; i++) {
+    int32_t a = src[i], b = src[i + 1];
+    for (int k = 0; k < 2; k++) {
+      int32_t v = a + ((b - a) * k) / 2;
+      v = (int32_t)(v * TTS_VOLUME);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      frame[f * 2] = v << 16;
+      frame[f * 2 + 1] = v << 16;
+      f++;
+    }
+  }
+  Speaker.write((uint8_t *)frame, f * 2 * sizeof(int32_t));
+  gRtPlayed += 480;
+}
+
+// Playback runs in its own task on the other core. Feeding I2S from the socket
+// loop meant a burst of large 24 kHz chunks - JSON parse plus base64 decode -
+// could block the writer for longer than the ~30 ms the DMA holds, draining it
+// mid-word. A prebuffer cannot fix that: the stall is downstream of the ring.
+static TaskHandle_t gRtPlayTask = nullptr;
+static volatile bool gRtPlayRun = false;
+
+static void rtPlayTaskFn(void *arg) {
+  bool playing = false;
+  while (gRtPlayRun) {
+    size_t avail = rtAvailable();
+    if (!playing && avail >= RT_PREBUFFER) playing = true;
+    if (playing) {
+      if (avail >= 481) {
+        rtPlayBlock();      // blocks on DMA, which paces this loop
+        continue;
+      }
+      // Drop the sub-block remainder (under 20 ms) rather than let it prepend
+      // itself to the next reply.
+      gRtTail = gRtHead;
+      playing = false;      // run drained; next turn buffers again
+    }
+    vTaskDelay(1);
+  }
+  gRtPlayTask = nullptr;
+  vTaskDelete(NULL);
+}
+
+// The model emits no audio on a tool turn, so without this the device goes
+// mute for the whole search. A local chime costs nothing and is what every
+// voice assistant does here.
+static void rtThinkingCue() {
+  playTone(880, 90);
+  delay(60);
+  playTone(1175, 90);
+}
+
+static bool rtSendJson(JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  return gWs.send(out);
+}
+
+// One conversation. Opens the socket, streams microphone up and audio down
+// until the user goes quiet, then tears everything down.
+// Open the socket and configure the session. Used for the initial connect and
+// again after a web_search, which closes the socket so only one TLS session
+// exists at a time - two do not fit in the internal heap.
+static bool rtConnectAndConfigure() {
+  String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
+  uint32_t t0 = millis();
+  // Configure exactly once for the lifetime of the program. addHeader() appends
+  // to a vector that WebsocketsClient::operator= does not assign, so neither a
+  // second call nor `gWs = WebsocketsClient()` clears it - headers accumulate
+  // across attempts and across sessions. OpenAI answers a duplicated
+  // Authorization header with 400 Bad Request, confirmed by replaying both
+  // handshakes against the live endpoint, which is why this worked for the
+  // first few sessions after boot and then failed until reboot.
+  static bool wsConfigured = false;
+  if (!wsConfigured) {
+    gWs.setCACert(OPENAI_ROOT_CA);
+    gWs.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+    gWs.onMessage(rtOnMessage);
+    wsConfigured = true;
+  }
+
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+    connected = gWs.connect(url);
+    if (!connected) {
+      logf("connect attempt %d failed (largest block %u)",
+           attempt, (unsigned)ESP.getMaxAllocHeap());
+      delay(500);
+    }
+  }
+  if (!connected) {
+    // Only probe on total failure, so the extra session does not fragment the
+    // heap on the common path. It separates transport from the upgrade.
+    NetworkClientSecure probe;
+    probe.setCACert(OPENAI_ROOT_CA);
+    probe.setHandshakeTimeout(15);
+    if (probe.connect("api.openai.com", 443)) {
+      logf("but plain TLS succeeded - the websocket upgrade is what failed");
+      probe.stop();
+    } else {
+      char err[128] = {0};
+      int code = probe.lastError(err, sizeof(err));
+      logf("plain TLS also failed (%d) %s - transport problem", code, err);
+    }
+    logf("realtime connect failed after 3 attempts");
+    return false;
+  }
+  logf("realtime connected in %lu ms", (unsigned long)(millis() - t0));
+
+  // GA session shape: formats are objects, and mu-law keeps this to ~8 KB/s
+  // each way instead of the 48 KB/s that pcm16 would need.
+  {
+    JsonDocument cfg;
+    cfg["type"] = "session.update";
+    JsonObject sess = cfg["session"].to<JsonObject>();
+    sess["type"] = "realtime";
+    sess["instructions"] = REALTIME_INSTRUCTIONS;
+    sess["output_modalities"].to<JsonArray>().add("audio");
+
+    // One tool, chosen automatically. "required" would make the model emit a
+    // call instead of speech on every turn; with "auto" and a tool it actually
+    // needs, it calls only for current facts and speaks directly otherwise -
+    // verified against the live API on "what day is it" (calls) versus "what
+    // is a Roth IRA" (does not).
+    sess["tool_choice"] = "auto";
+    JsonArray tools = sess["tools"].to<JsonArray>();
+    JsonObject search = tools.add<JsonObject>();
+    search["type"] = "function";
+    search["name"] = "web_search";
+    search["description"] =
+      "Look up current information: today's date, weather, news, prices, scores, "
+      "schedules, or anything that changes over time. Use it whenever you are not "
+      "certain of a current fact.";
+    JsonObject params = search["parameters"].to<JsonObject>();
+    params["type"] = "object";
+    JsonObject props = params["properties"].to<JsonObject>();
+    props["query"]["type"] = "string";
+    props["query"]["description"] = "What to search for";
+    params["required"].to<JsonArray>().add("query");
+
+
+    JsonObject audio = sess["audio"].to<JsonObject>();
+    JsonObject in = audio["input"].to<JsonObject>();
+    in["format"]["type"] = "audio/pcmu";
+    // Transcribing your side too, so "stop" and "shut up" can be recognised.
+    in["transcription"]["model"] = "whisper-1";
+    JsonObject turn = in["turn_detection"].to<JsonObject>();
+    turn["type"] = "server_vad";
+    turn["silence_duration_ms"] = 400;
+
+    JsonObject out = audio["output"].to<JsonObject>();
+    out["format"]["type"] = "audio/pcm";
+    out["format"]["rate"] = RT_RX_RATE;
+    out["voice"] = REALTIME_VOICE;
+    rtSendJson(cfg);
+  }
+
+  return true;
+}
+
+static void realtimeSession() {
+  if (!gRtRing) {
+    gRtRing = (int16_t *)ps_malloc(RT_RING * sizeof(int16_t));
+    if (!gRtRing) {
+      logf("no PSRAM for the realtime ring");
+      return;
+    }
+  }
+  gRtHead = gRtTail = 0;
+  gRtTranscript = "";
+  gRtSawAudio = false;
+  gRtRxBytes = gRtTxBytes = gRtPlayed = gRtEvents = gRtDropped = 0;
+  gRtResponseDone = false;
+  gRtTurnText = "";
+  gRtTurnRx = 0;
+  gRtIntent = RT_INTENT_UNKNOWN;
+  gRtStopRequested = false;
+  gRtCallId = "";
+  gRtSearchPending = false;
+  gRtSearchQuery = "";
+  gRtSearchCallId = "";
+
+  setStatus(STATUS_WORKING);
+  oledShow("Nova", "Connecting...");
+
+  // setInsecure() is a no-op on ESP32 in this library: upgradeToSecuredConnection()
+  // only applies setInsecure on ESP8266, so without a CA the WiFiClientSecure it
+  // creates has no trust anchor and the handshake fails before the upgrade.
+
+  // The TLS probe that used to live here confirmed transport is fine and the
+  // failures are in the websocket upgrade, so it is gone: opening and tearing
+  // down a full TLS session immediately before the real one only fragments the
+  // heap at the worst moment.
+
+  String url = String("wss://api.openai.com/v1/realtime?model=") + REALTIME_MODEL;
+  uint32_t t0 = millis();
+
+  if (!rtConnectAndConfigure()) {
+    oledShow("Error", "Could not connect");
+    setStatus(STATUS_ERROR);
+    return;
+  }
+
+  // The wake phrase is still in the I2S buffer at this point. Throw it away,
+  // both locally and server-side, or it gets treated as the first utterance.
+  {
+    static int32_t flush[I2S_CHUNK_FRAMES];
+    for (int i = 0; i < 12; i++) I2S.readBytes((char *)flush, sizeof(flush));
+    JsonDocument clr;
+    clr["type"] = "input_audio_buffer.clear";
+    rtSendJson(clr);
+  }
+
+  // Pinned to core 0: ESP-SR is paused for the session, so that core is idle,
+  // and this keeps the writer off the core running the socket.
+  gRtPlayRun = true;
+  xTaskCreatePinnedToCore(rtPlayTaskFn, "rt_play", 4096, nullptr, 6, &gRtPlayTask, 0);
+
+  oledShow("Nova", "Listening...");
+  setStatus(STATUS_RECORDING);
+  emitEvent("state", "state", "realtime");
+
+  static int32_t raw[I2S_CHUNK_FRAMES];
+  static uint8_t ulaw[1024];
+  static char b64[1500];
+  size_t ulawLen = 0;
+
+  uint32_t start = millis();
+  uint32_t lastVoice = millis();
+  bool awaitingReply = false;
+  String shown;
+
+  while (gWs.available() && (millis() - start) < REALTIME_MAX_MS) {
+    gWs.poll();
+
+    // Playback is the writer task's job now. While anything is queued or
+    // playing, skip the microphone: there is no echo cancellation, so the
+    // server would otherwise hear our own speaker.
+    // Match the player's block size, not zero. It consumes 480 samples at a
+    // time and needs 481, so 1-480 always remain - testing for > 0 meant this
+    // branch never exited, the turn decision was never reached, and lastVoice
+    // was refreshed every pass so the idle timeout could not fire either.
+    if (rtAvailable() >= 481) {
+      lastVoice = millis();
+      if (gRtTranscript.length() && gRtTranscript != shown) {
+        shown = gRtTranscript;
+        oledShow("Nova", shown.c_str());
+      }
+      delay(2);
+      continue;
+    }
+
+    // No echo cancellation here, so only capture when nothing is playing -
+    // otherwise the server hears our own speaker and interrupts itself.
+    size_t bytes = I2S.readBytes((char *)raw, sizeof(raw));
+    size_t frames = bytes / sizeof(int32_t);
+
+    int32_t peak = 0;
+    for (size_t i = 0; i + 1 < frames; i += 2) {
+      // 24-bit -> 16-bit, high-passed, then 16 kHz -> 8 kHz by averaging pairs.
+      float x0 = (float)(raw[i] >> 8);
+      float y0 = HPF_ALPHA * (gHpfY1 + x0 - gHpfX1);
+      gHpfX1 = x0; gHpfY1 = y0;
+      float x1 = (float)(raw[i + 1] >> 8);
+      float y1 = HPF_ALPHA * (gHpfY1 + x1 - gHpfX1);
+      gHpfX1 = x1; gHpfY1 = y1;
+
+      int32_t v = (int32_t)(((y0 + y1) * 0.5f) * MIC_GAIN / 256.0f);
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      int32_t mag = v < 0 ? -v : v;
+      if (mag > peak) peak = mag;
+
+      if (ulawLen < sizeof(ulaw)) ulaw[ulawLen++] = pcmToUlaw((int16_t)v);
+    }
+    if (peak > SPEECH_MIN_PEAK) {
+      lastVoice = millis();
+      awaitingReply = false;  // you answered; the next turn decides afresh
+    }
+
+    if (ulawLen >= 800) {
+      size_t n = 0;
+      if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &n, ulaw, ulawLen) == 0) {
+        b64[n] = '\0';
+        JsonDocument msg;
+        msg["type"] = "input_audio_buffer.append";
+        msg["audio"] = b64;
+        rtSendJson(msg);
+        gRtTxBytes += ulawLen;
+      }
+      ulawLen = 0;
+    }
+
+    // A finished turn with the ring drained means the reply has been spoken.
+    // End there unless it asked a question, in which case stay open just long
+    // enough for an answer.
+    if (gRtSearchPending) {
+      gRtSearchPending = false;
+
+      // arguments arrive as a JSON string, not an object
+      String query;
+      {
+        JsonDocument args;
+        if (!deserializeJson(args, gRtSearchQuery)) {
+          query = (const char *)(args["query"] | "");
+        }
+      }
+      if (!query.length()) query = gRtSearchQuery;
+
+      logf("search: %s", query.c_str());
+      oledShow("Searching", query.c_str());
+      rtThinkingCue();
+
+      // Close the socket for the duration of the search. Two TLS sessions do
+      // not fit: with the websocket open, the search handshake fails with
+      // "SSL - Memory allocation failed" at ~31 KB largest free block, every
+      // time. Reconnecting costs ~2.3 s and is the price of a working lookup.
+      gWs.close();
+      delay(50);
+
+      String result;
+      uint32_t s0 = millis();
+      bool ok = askOpenAI(query.c_str(), result, true);
+      logf("search %s in %lu ms: %s", ok ? "ok" : "FAILED",
+           (unsigned long)(millis() - s0),
+           ok ? result.substring(0, 100).c_str() : "");
+
+      if (!ok || !result.length()) {
+        result = "The lookup failed.";
+      }
+      stripLinks(result);
+
+      if (!rtConnectAndConfigure()) {
+        logf("could not reconnect after the search");
+        break;
+      }
+
+      // The reconnect is a fresh session, so the tool call it was answering is
+      // gone. Restate the exchange as a plain turn instead.
+      String prompt = "I asked: " + query +
+                      "\nA search returned: " + result +
+                      "\nAnswer me in one or two short spoken sentences using that.";
+      JsonDocument item;
+      item["type"] = "conversation.item.create";
+      JsonObject msg = item["item"].to<JsonObject>();
+      msg["type"] = "message";
+      msg["role"] = "user";
+      JsonObject content = msg["content"].to<JsonArray>().add<JsonObject>();
+      content["type"] = "input_text";
+      content["text"] = prompt;
+      rtSendJson(item);
+
+      JsonDocument go;
+      go["type"] = "response.create";
+      rtSendJson(go);
+
+      lastVoice = millis();
+      oledShow("Nova", "...");
+      continue;
+    }
+
+    if (gRtStopRequested) {
+      logf("stop requested, closing");
+      break;
+    }
+
+    // Require audio: the server's VAD can hear the tail of the wake word and
+    // emit an empty turn, which would otherwise close the session instantly.
+    if (gRtResponseDone && gRtTurnRx > 0 && rtAvailable() < 481) {
+      gRtResponseDone = false;
+
+      String turn = gRtTurnText;
+      turn.trim();
+
+      // A lookup answers in one short sentence; an explanation runs longer and
+      // invites a follow-up. Measured on real replies: "Chelsea's next match is
+      // on Saturday against Liverpool." is 53 characters, a weather answer 79,
+      // while an explanation of a concept runs well past 150.
+      bool stay = turn.endsWith("?") || turn.length() >= REALTIME_OPEN_CHARS;
+
+      if (stay) {
+        logf("open topic (%d chars), listening %lu ms for a follow-up",
+             (int)turn.length(), (unsigned long)REALTIME_FOLLOWUP_MS);
+        awaitingReply = true;
+        lastVoice = millis();
+      } else {
+        logf("lookup answered (%d chars), closing", (int)turn.length());
+        break;
+      }
+    }
+
+    uint32_t idleLimit = awaitingReply ? REALTIME_FOLLOWUP_MS : REALTIME_IDLE_MS;
+    if ((millis() - lastVoice) > idleLimit) {
+      logf("realtime idle, closing");
+      break;
+    }
+    if (gButtonHeld) {
+      logf("button pressed, closing");
+      break;
+    }
+  }
+
+  // Let the tail of the reply finish before tearing the writer down.
+  uint32_t drainUntil = millis() + 3000;
+  while (rtAvailable() >= 481 && millis() < drainUntil) delay(10);
+  gRtPlayRun = false;
+  while (gRtPlayTask != nullptr) delay(5);
+
+  gWs.close();
+  logf("realtime ended after %lu ms: events=%lu tx=%lu B (%.1f s) rx=%lu B (%.1f s) "
+       "played=%.1f s dropped=%lu",
+       (unsigned long)(millis() - start), (unsigned long)gRtEvents,
+       (unsigned long)gRtTxBytes, gRtTxBytes / 8000.0f,
+       (unsigned long)gRtRxBytes, gRtRxBytes / 2.0f / RT_RX_RATE,
+       gRtPlayed / (float)RT_RX_RATE, (unsigned long)gRtDropped);
+  if (gRtTranscript.length()) logf("said: %s", gRtTranscript.c_str());
+  if (gRtTranscript.length()) emitEvent("answer", "text", gRtTranscript.c_str());
+}
+#endif  // REALTIME_ENABLED
 
 // ---------------------------------------------------------------- button ---
 // Simple debounce: the level has to stay put for DEBOUNCE_MS before it counts.
@@ -1818,6 +2493,52 @@ void loop() {
   wifiPollScan();
 
   gButtonHeld = buttonPressedStable();
+
+#if REALTIME_ENABLED
+  if (gState == ST_LISTENING && (gWakeRequested || gButtonHeld)) {
+    gWakeRequested = false;
+    gState = ST_UPLOADING;  // stops the detector re-triggering mid-session
+
+    // Pause first, then stop. ESP-SR's models stay resident through a pause,
+    // leaving only ~31 KB contiguous - not enough for a second TLS handshake,
+    // so a web_search during a session failed with "SSL - Memory allocation
+    // failed". Stopping frees them for the whole session.
+    //
+    // An earlier attempt called sr_stop() straight from loop() and corrupted
+    // the heap, because the feed task could be inside our fill callback.
+    // Pausing parks that task on its event group first, which makes the
+    // teardown safe.
+    // Pause only. sr_stop() frees the heap a concurrent TLS handshake needs,
+    // but wake detection stopped working both times it was enabled, and no
+    // mechanism was ever established - so the search closes the socket instead,
+    // and ESP-SR is left alone.
+    sr_pause();
+    realtimeSession();
+    sr_resume();
+    sr_set_mode(SR_MODE_COMMAND);
+
+    gWakeRequested = false;
+    gState = ST_LISTENING;
+    setStatus(STATUS_IDLE);
+    emitEvent("state", "state", "ready");
+    return;
+  }
+  // Fall through to the shared housekeeping below rather than returning: the
+  // WiFi keepalive lives at the end of loop() and still needs to run.
+  oledTick();
+
+  static uint32_t rtWifiCheck = 0;
+  if (millis() - rtWifiCheck > 10000) {
+    rtWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      logf("wifi dropped, reconnecting");
+      WiFi.reconnect();
+    }
+  }
+  delay(5);
+  return;
+#endif
+
 
   // Edge-trigger the display so a finished answer stays on screen instead of
   // being redrawn (and reset to page 1) on every pass through loop().

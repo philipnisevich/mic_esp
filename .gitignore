@@ -13,3 +13,13 @@ __pycache__/
 .venv/
 
 .DS_Store
+
+.vscode/
+
+# NovaLive (ESP-IDF)
+NovaLive/main/config.h
+NovaLive/build/
+NovaLive/managed_components/
+NovaLive/sdkconfig
+NovaLive/sdkconfig.old
+NovaLive/dependencies.lock
