@@ -16,13 +16,14 @@
 #define PIN_AMP_DIN  12
 #define PIN_BUTTON   0
 
-// Round 1.28" TFT (GC9A01, 240x240, 4-wire SPI).
-#define PIN_TFT_SCLK 13
-#define PIN_TFT_MOSI 14
+// Round 1.28" TFT (GC9A01, 240x240, SPI). No backlight pin on this board -
+// the backlight is tied on-board, always on. SCK/SDA here are the module's
+// own silkscreen names for SPI clock/data-in (not I2C).
+#define PIN_TFT_SCLK 13  // SCK
+#define PIN_TFT_MOSI 14  // SDA
 #define PIN_TFT_CS   15
 #define PIN_TFT_DC   16
 #define PIN_TFT_RST  17
-#define PIN_TFT_BL   18
 
 #define NOVA_SAMPLE_RATE 16000
 

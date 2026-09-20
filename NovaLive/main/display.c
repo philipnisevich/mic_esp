@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -325,10 +324,6 @@ static esp_err_t panel_init(esp_lcd_panel_handle_t *panel, esp_lcd_panel_io_hand
 
 void display_init(void)
 {
-    gpio_config_t bl = {.pin_bit_mask = 1ULL << PIN_TFT_BL, .mode = GPIO_MODE_OUTPUT};
-    gpio_config(&bl);
-    gpio_set_level(PIN_TFT_BL, 0);
-
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_io_handle_t io = NULL;
     if (panel_init(&panel, &io) != ESP_OK) {
@@ -365,7 +360,6 @@ void display_init(void)
     lvgl_port_unlock();
     lv_timer_create(clock_tick_cb, 500, NULL);
 
-    gpio_set_level(PIN_TFT_BL, 1);
     s_ready = true;
-    ESP_LOGI(TAG, "round display up on SPI2, backlight GPIO %d", PIN_TFT_BL);
+    ESP_LOGI(TAG, "round display up on SPI2");
 }

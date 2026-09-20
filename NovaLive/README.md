@@ -76,7 +76,8 @@ unchanged and keeps working whether or not the display is attached.
 
 Same wiring as MicScribe (see `../README.md`): INMP441 on GPIO 4/5/6,
 MAX98357A on 10/11/12. Round 1.28" TFT (GC9A01, 240x240, 4-wire SPI, optional)
-on SCLK 13 / MOSI 14 / CS 15 / DC 16 / RST 17 / BL 18.
+on SCK 13 / SDA 14 / CS 15 / DC 16 / RST 17 (no backlight pin on this board -
+it's tied on-board, always on).
 
 1. **Backend** (`Nova/backend/.env`): set a device token and choose whose
    connectors the device uses:
