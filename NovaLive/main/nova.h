@@ -14,9 +14,15 @@
 #define PIN_AMP_BCLK 10
 #define PIN_AMP_LRC  11
 #define PIN_AMP_DIN  12
-#define PIN_I2C_SDA  8
-#define PIN_I2C_SCL  9
 #define PIN_BUTTON   0
+
+// Round 1.28" TFT (GC9A01, 240x240, 4-wire SPI).
+#define PIN_TFT_SCLK 13
+#define PIN_TFT_MOSI 14
+#define PIN_TFT_CS   15
+#define PIN_TFT_DC   16
+#define PIN_TFT_RST  17
+#define PIN_TFT_BL   18
 
 #define NOVA_SAMPLE_RATE 16000
 
@@ -83,11 +89,26 @@ const esp_peer_signaling_impl_t *nova_signaling_impl(void);
 typedef enum { ROLE_USER, ROLE_NOVA, ROLE_SYSTEM } nova_role_t;
 typedef enum { TASK_LIGHT_NONE, TASK_LIGHT_RUNNING, TASK_LIGHT_DONE } task_light_t;
 
+// Mirrors main.c's nova_state_t, but only as much as the orb needs to pick
+// its animation: DISP_CLOCK covers both "no network" and "say the wake
+// word" (the clock face itself doesn't distinguish them - display_state()'s
+// label still does, off-screen in the serial log).
+typedef enum {
+    DISP_CLOCK,
+    DISP_CONNECTING,
+    DISP_LIVE_IDLE,
+    DISP_RECORDING,
+    DISP_THINKING,
+    DISP_SPEAKING,
+} nova_display_state_t;
+
 void display_init(void);
 void display_state(const char *label);
+void display_orb_state(nova_display_state_t st);
 void display_text(nova_role_t role, const char *text);
 void display_task_light(task_light_t light);
 void display_selftest(void);  // fills the screen with sample text; reports draw errors on serial
+void display_time_synced(void);  // net.c: the clock face can stop showing "--:--"
 
 // ------------------------------------------------------------------- led ---
 void led_init(void);

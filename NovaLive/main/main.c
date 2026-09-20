@@ -70,6 +70,17 @@ static const char *STATE_NAME[] = {
     [ST_THINKING] = "thinking",
     [ST_SPEAKING] = "speaking",
 };
+// The round display's clock face covers both "no network" and "say the
+// wake word" - everything else is the orb, one state each.
+static const nova_display_state_t STATE_DISPLAY[] = {
+    [ST_NO_NETWORK] = DISP_CLOCK,
+    [ST_WAKE_LISTENING] = DISP_CLOCK,
+    [ST_POWERING_ON] = DISP_CONNECTING,
+    [ST_LIVE_IDLE] = DISP_LIVE_IDLE,
+    [ST_RECORDING] = DISP_RECORDING,
+    [ST_THINKING] = DISP_THINKING,
+    [ST_SPEAKING] = DISP_SPEAKING,
+};
 
 typedef struct {
     nova_event_type_t type;
@@ -102,6 +113,7 @@ static void set_state(nova_state_t st)
     s_state = st;
     led_set_session(st != ST_NO_NETWORK && st != ST_WAKE_LISTENING);
     display_state(STATE_LABEL[st]);
+    display_orb_state(STATE_DISPLAY[st]);
     serial_emit("state", "state", STATE_NAME[st]);
 }
 

@@ -21,3 +21,6 @@ dependencies:
     version: "*"
     path: ../../third_party/esp-webrtc-solution/components/webrtc_utils
   espressif/led_strip: "^3.0.0"
+  espressif/esp_lcd_gc9a01: "^2.0.0"
+  lvgl/lvgl: "^9"
+  espressif/esp_lvgl_port: "^2"

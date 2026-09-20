@@ -2,11 +2,14 @@
 // like MicScribe: web/wifi-setup.html sends wifi_scan / wifi_connect over
 // serial, and credentials are saved only once a connection succeeds.
 
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -17,6 +20,30 @@
 #define TAG "net"
 #define NVS_NS "nova"
 #define ATTEMPT_MAX_FAILURES 3
+
+// newlib's TZ wants a POSIX string (e.g. "PST8PDT,M3.2.0,M11.1.0"), but
+// NOVA_TIMEZONE is the IANA name ("America/Los_Angeles") the backend wants -
+// ESP-IDF ships no zoneinfo database to convert between them. This is a
+// deliberately small table, not full tzdata: an unrecognized zone falls
+// back to UTC (a warning is logged once). A literal POSIX string in
+// NOVA_TIMEZONE (no '/') is passed through as-is.
+static const struct { const char *iana, *posix; } TZ_TABLE[] = {
+    {"America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0"},
+    {"America/Denver",      "MST7MDT,M3.2.0,M11.1.0"},
+    {"America/Chicago",     "CST6CDT,M3.2.0,M11.1.0"},
+    {"America/New_York",    "EST5EDT,M3.2.0,M11.1.0"},
+    {"America/Anchorage",   "AKST9AKDT,M3.2.0,M11.1.0"},
+    {"Pacific/Honolulu",    "HST10"},
+    {"Europe/London",       "GMT0BST,M3.5.0/1,M10.5.0"},
+    {"Europe/Berlin",       "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Paris",        "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Madrid",       "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Asia/Tokyo",          "JST-9"},
+    {"Asia/Shanghai",       "CST-8"},
+    {"Asia/Kolkata",        "IST-5:30"},
+    {"Australia/Sydney",    "AEST-10AEDT,M10.1.0,M4.1.0/3"},
+    {"UTC",                 "UTC0"},
+};
 
 static bool s_connected, s_attempt, s_have_saved;
 static volatile bool s_scanning;
@@ -71,6 +98,48 @@ static void save_credentials(void)
     s_have_saved = true;
 }
 
+static void apply_timezone(void)
+{
+    const char *posix = "UTC0";
+    if (NOVA_TIMEZONE[0]) {
+        bool found = false;
+        for (size_t i = 0; i < sizeof(TZ_TABLE) / sizeof(TZ_TABLE[0]) && !found; i++) {
+            if (strcmp(NOVA_TIMEZONE, TZ_TABLE[i].iana) == 0) {
+                posix = TZ_TABLE[i].posix;
+                found = true;
+            }
+        }
+        if (!found && strchr(NOVA_TIMEZONE, '/') == NULL) {
+            posix = NOVA_TIMEZONE;  // literal POSIX TZ string
+            found = true;
+        }
+        if (!found) {
+            ESP_LOGW(TAG, "unknown NOVA_TIMEZONE \"%s\" - falling back to UTC (add it to TZ_TABLE in net.c)", NOVA_TIMEZONE);
+        }
+    }
+    setenv("TZ", posix, 1);
+    tzset();
+}
+
+static void on_time_sync(struct timeval *tv)
+{
+    (void)tv;
+    ESP_LOGI(TAG, "time synced");
+    display_time_synced();
+}
+
+static void start_sntp(void)
+{
+    static bool started;
+    if (started) {
+        return;
+    }
+    started = true;
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    cfg.sync_cb = on_time_sync;
+    esp_netif_sntp_init(&cfg);
+}
+
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -114,6 +183,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_attempt = false;
         ESP_LOGI(TAG, "on \"%s\" as %s", s_ssid, s_ip);
         emit_status("connected");
+        start_sntp();
         nova_post(EV_NET_UP, NULL);
     }
 }
@@ -239,6 +309,7 @@ esp_err_t net_init(void)
         return err;
     }
     load_settings();
+    apply_timezone();
 
     esp_netif_init();
     esp_event_loop_create_default();

@@ -1,253 +1,371 @@
-// 0.96" SSD1306 (128x64, I2C): an inverted header with Nova's state - the
-// orb, in words - over the live transcript. Optional: everything works
-// without a display attached.
+// Round 1.28" TFT (GC9A01, 240x240, SPI), driven through LVGL via
+// esp_lvgl_port. Two screens, swapped by display_orb_state():
+//   clock  - minimalist HH:MM, shown at rest (no network / waiting for the
+//            wake word).
+//   orb    - a rotating gradient ring + soft glow, one look per state, from
+//            the wake word through the end of the conversation. Styled
+//            after NovaOrb.tsx in the seva7747/Nova web frontend this
+//            firmware already mirrors (see main.c).
+// Optional: nothing breaks if it's not wired up - SPI is write-only, though,
+// so (unlike the OLED's I2C probe) there's no way to detect that and skip
+// LVGL; it just renders to a panel that isn't there. There's also no room
+// for the live transcript on a 240x240 round face, so display_text() is a
+// no-op here - the serial log and bridge.py still carry the full transcript.
 
+#include <stdio.h>
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "driver/i2c_master.h"
+#include <time.h>
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_ssd1306.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_gc9a01.h"
+#include "esp_lvgl_port.h"
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "font5x7.h"
 #include "nova.h"
 
 #define TAG "display"
 
-#define W 128
-#define H 64
-#define COLS (W / 6)
-#define ROWS (H / 8)
-#define BODY_ROWS (ROWS - 1)
+#define LCD_HOST     SPI2_HOST
+#define LCD_W        240
+#define LCD_H        240
+#define LCD_PCLK_HZ  (40 * 1000 * 1000)  // 80 MHz default is tight over dupont wires
 
-static esp_lcd_panel_handle_t s_panel;
-static SemaphoreHandle_t s_lock;
-static uint8_t s_fb[W * H / 8];
-static char s_state[COLS + 1] = "";
-static char s_body[BODY_ROWS][COLS + 1];
+#define COL_BG      lv_color_hex(0x000000)
+#define COL_TEXT    lv_color_hex(0xE5E7EB)
+#define COL_RING    lv_color_hex(0x2A2F3A)
+#define COL_AMBER   lv_color_hex(0xFBBF24)
+#define COL_GREEN   lv_color_hex(0x34D399)
+
+static bool s_ready;
+static lv_disp_t *s_disp;
+static lv_obj_t *s_clock_screen, *s_clock_label, *s_clock_task_dot;
+static lv_obj_t *s_orb_screen, *s_orb_glow, *s_orb_ring, *s_orb_task_ring, *s_orb_label;
+static nova_display_state_t s_state = DISP_CLOCK;
 static task_light_t s_task = TASK_LIGHT_NONE;
-static int s_draw_errors;
+static char s_label[40] = "";
+static volatile bool s_time_synced;
 
-static void draw_char(int col, int row, char c, bool invert)
+void display_time_synced(void)  // called by net.c once SNTP lands the first fix
 {
-    if (c < 32 || c > 126) {
-        c = '?';
-    }
-    uint8_t *p = &s_fb[row * W + col * 6];
-    for (int i = 0; i < 5; i++) {
-        p[i] = invert ? ~FONT5X7[c - 32][i] : FONT5X7[c - 32][i];
-    }
-    p[5] = invert ? 0xFF : 0x00;
+    s_time_synced = true;
 }
 
-static void draw_text(int row, const char *text, bool invert)
+// -------------------------------------------------------------- per-state orb look ---
+// Ring rotation period, indicator arc span (degrees), and a representative
+// colour per state - approximating NovaOrb.tsx's conic-gradient chase ring
+// (arcWidth is that component's "% of the circle lit up").
+typedef struct {
+    uint32_t period_ms;
+    int16_t  arc_deg;
+    lv_color_t color;
+} orb_look_t;
+
+static const orb_look_t ORB_LOOK[] = {
+    [DISP_CONNECTING] = {850,  198, {.blue = 0xFA, .green = 0xA5, .red = 0x60}},  // #60a5fa
+    [DISP_LIVE_IDLE]  = {4000, 108, {.blue = 0x99, .green = 0xD3, .red = 0x34}},  // #34d399
+    [DISP_RECORDING]  = {2100, 115, {.blue = 0xD4, .green = 0xEA, .red = 0x5E}},  // #5eead4
+    [DISP_THINKING]   = {650,  79,  {.blue = 0xFA, .green = 0x8B, .red = 0xA7}},  // #a78bfa
+    [DISP_SPEAKING]   = {3200, 162, {.blue = 0xFA, .green = 0xA5, .red = 0x60}},  // #60a5fa
+};
+
+// -------------------------------------------------------------------- anim helpers ---
+static void set_opa(void *obj, int32_t v)
 {
-    for (int col = 0; col < COLS; col++) {
-        draw_char(col, row, *text ? *text++ : ' ', invert);
-    }
-    if (invert) {  // fill the 2 px right of the last column
-        s_fb[row * W + W - 2] = s_fb[row * W + W - 1] = 0xFF;
-    }
+    lv_obj_set_style_opa(obj, (lv_opa_t)v, LV_PART_MAIN);
 }
 
-static void flush(void)
+static void set_arc_opa(void *obj, int32_t v)
 {
-    if (s_panel == NULL) {
+    lv_obj_set_style_arc_opa(obj, (lv_opa_t)v, LV_PART_INDICATOR);
+}
+
+static void breathe_anim(lv_obj_t *obj)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, set_opa);
+    lv_anim_set_values(&a, 70, 160);
+    lv_anim_set_time(&a, 2200);
+    lv_anim_set_playback_time(&a, 2200);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+}
+
+static void pulse_anim(lv_obj_t *obj, lv_anim_exec_xcb_t exec_cb)
+{
+    lv_anim_delete(obj, NULL);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, exec_cb);
+    lv_anim_set_values(&a, 40, 255);
+    lv_anim_set_time(&a, 800);
+    lv_anim_set_playback_time(&a, 800);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+}
+
+// ------------------------------------------------------------------- task light ---
+// Same priority rule as led.c: amber pulse while a background task runs,
+// steady green once it's done, invisible otherwise. Applied to both
+// screens' indicators unconditionally, so whichever one is on screen is
+// already right.
+void display_task_light(task_light_t light)
+{
+    if (!s_ready || light == s_task) {
         return;
     }
-    char header[COLS + 1];
-    const char *light = s_task == TASK_LIGHT_RUNNING ? "BG" : s_task == TASK_LIGHT_DONE ? "OK" : "";
-    snprintf(header, sizeof(header), " %-*.*s%s", COLS - 1 - (int)strlen(light), COLS - 1 - (int)strlen(light), s_state, light);
-    draw_text(0, header, true);
-    for (int r = 0; r < BODY_ROWS; r++) {
-        draw_text(r + 1, s_body[r], false);
+    s_task = light;
+    lvgl_port_lock(0);
+    lv_anim_delete(s_clock_task_dot, NULL);
+    lv_anim_delete(s_orb_task_ring, NULL);
+    if (light == TASK_LIGHT_NONE) {
+        lv_obj_set_style_opa(s_clock_task_dot, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(s_orb_task_ring, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    } else if (light == TASK_LIGHT_RUNNING) {
+        lv_obj_set_style_bg_color(s_clock_task_dot, COL_AMBER, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(s_orb_task_ring, COL_AMBER, LV_PART_INDICATOR);
+        pulse_anim(s_clock_task_dot, set_opa);
+        pulse_anim(s_orb_task_ring, set_arc_opa);
+    } else {  // TASK_LIGHT_DONE
+        lv_obj_set_style_bg_color(s_clock_task_dot, COL_GREEN, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(s_orb_task_ring, COL_GREEN, LV_PART_INDICATOR);
+        lv_obj_set_style_opa(s_clock_task_dot, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(s_orb_task_ring, LV_OPA_COVER, LV_PART_INDICATOR);
     }
-    esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, W, H, s_fb);
-    if (err != ESP_OK) {
-        static int64_t last_log_us;
-        s_draw_errors++;
-        if (esp_timer_get_time() - last_log_us > 1000000) {
-            ESP_LOGW(TAG, "OLED draw failed (%d so far): %s", s_draw_errors, esp_err_to_name(err));
-            last_log_us = esp_timer_get_time();
-        }
-    }
+    lvgl_port_unlock();
 }
 
-// UTF-8 punctuation GPT-Live likes (curly quotes, dashes) -> ASCII.
-static void to_ascii(const char *in, char *out, size_t cap)
+// ------------------------------------------------------------------------- clock ---
+static void clock_tick_cb(lv_timer_t *timer)
 {
-    size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)in; *p && o + 1 < cap; p++) {
-        if (*p < 0x80) {
-            out[o++] = *p == '\n' ? ' ' : *p;
-        } else if (p[0] == 0xE2 && p[1] == 0x80 && p[2]) {
-            uint8_t k = p[2];
-            out[o++] = (k == 0x98 || k == 0x99) ? '\'' : (k == 0x9C || k == 0x9D) ? '"' : (k == 0x93 || k == 0x94) ? '-' : (k == 0xA6) ? '.' : '?';
-            p += 2;
-        } else if ((*p & 0xC0) == 0xC0) {
-            out[o++] = '?';
-            while ((p[1] & 0xC0) == 0x80) {
-                p++;
-            }
-        }
+    (void)timer;
+    if (s_state != DISP_CLOCK) {
+        return;
     }
-    out[o] = 0;
+    char buf[8];
+    if (!s_time_synced) {
+        strlcpy(buf, "--:--", sizeof(buf));
+    } else {
+        time_t now = time(NULL);
+        struct tm t;
+        localtime_r(&now, &t);
+        snprintf(buf, sizeof(buf), t.tm_sec % 2 ? "%02d:%02d" : "%02d %02d", t.tm_hour, t.tm_min);
+    }
+    lv_label_set_text(s_clock_label, buf);
 }
 
-// Word-wrap and keep the last BODY_ROWS lines: text streams in, so the
-// newest words are the ones worth showing.
-static void layout(const char *text)
+// --------------------------------------------------------------------------- orb ---
+void display_orb_state(nova_display_state_t st)
 {
-    char ring[BODY_ROWS][COLS + 1];
-    char cur[COLS + 1];
-    int count = 0, len = 0;
-    const char *p = text;
-
-#define PUSH_LINE()                                               \
-    do {                                                          \
-        cur[len] = 0;                                             \
-        strlcpy(ring[count % BODY_ROWS], cur, sizeof(ring[0]));   \
-        count++;                                                  \
-        len = 0;                                                  \
-    } while (0)
-
-    while (*p) {
-        while (*p == ' ') {
-            p++;
-        }
-        const char *w = p;
-        while (*p && *p != ' ') {
-            p++;
-        }
-        int wl = p - w;
-        while (wl > 0) {
-            if (len && wl + 1 > COLS - len) {
-                PUSH_LINE();  // word doesn't fit after what's there: new line
-                continue;
-            }
-            if (len) {
-                cur[len++] = ' ';
-            }
-            int take = wl < COLS - len ? wl : COLS - len;  // hard-break words longer than a line
-            memcpy(cur + len, w, take);
-            len += take;
-            w += take;
-            wl -= take;
-            if (wl > 0) {
-                PUSH_LINE();
-            }
-        }
+    if (!s_ready || st == s_state) {
+        return;
     }
-    if (len) {
-        PUSH_LINE();
+    s_state = st;
+    lvgl_port_lock(0);
+    if (st == DISP_CLOCK) {
+        lv_disp_load_scr(s_clock_screen);
+    } else {
+        const orb_look_t *look = &ORB_LOOK[st];
+        lv_label_set_text(s_orb_label, s_label);
+        lv_arc_set_angles(s_orb_ring, 0, look->arc_deg);
+        lv_obj_set_style_arc_color(s_orb_ring, look->color, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(s_orb_glow, look->color, LV_PART_MAIN);
+        lv_arc_set_rotation(s_orb_ring, 0);
+        lv_anim_delete(s_orb_ring, NULL);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_orb_ring);
+        lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_arc_set_rotation);
+        lv_anim_set_values(&a, 0, 360);
+        lv_anim_set_time(&a, look->period_ms);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_linear);
+        lv_anim_start(&a);
+        lv_disp_load_scr(s_orb_screen);
     }
-#undef PUSH_LINE
-
-    int first = count > BODY_ROWS ? count - BODY_ROWS : 0;
-    for (int r = 0; r < BODY_ROWS; r++) {
-        int i = first + r;
-        strlcpy(s_body[r], i < count ? ring[i % BODY_ROWS] : "", sizeof(s_body[r]));
-    }
+    lvgl_port_unlock();
 }
 
 void display_state(const char *label)
 {
     ESP_LOGI(TAG, "[%s]", label);
-    if (s_lock == NULL) {
+    strlcpy(s_label, label, sizeof(s_label));
+    if (!s_ready || s_state == DISP_CLOCK) {
         return;
     }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    strlcpy(s_state, label, sizeof(s_state));
-    flush();
-    xSemaphoreGive(s_lock);
+    lvgl_port_lock(0);
+    lv_label_set_text(s_orb_label, s_label);
+    lvgl_port_unlock();
 }
 
+// A 240x240 round face has no room for a scrolling transcript the way the
+// OLED did - the serial log (and bridge.py) carry the full text instead.
 void display_text(nova_role_t role, const char *text)
 {
-    if (s_lock == NULL) {
-        return;
-    }
-    static char buf[700];
-    const char *prefix = role == ROLE_USER ? "You: " : role == ROLE_SYSTEM ? "! " : "";
-    char ascii[640];
-    to_ascii(text, ascii, sizeof(ascii));
-    snprintf(buf, sizeof(buf), "%s%s", prefix, ascii);
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    layout(buf);
-    flush();
-    xSemaphoreGive(s_lock);
-}
-
-void display_task_light(task_light_t light)
-{
-    if (s_lock == NULL || light == s_task) {
-        return;
-    }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_task = light;
-    flush();
-    xSemaphoreGive(s_lock);
+    (void)role;
+    (void)text;
 }
 
 void display_selftest(void)
 {
     display_state("Display test");
-    display_text(ROLE_NOVA, "Row two of the transcript area. This text wraps across several rows so all seven body rows fill up: one two three four five six seven eight nine ten eleven twelve thirteen.");
-    char line[96];
-    snprintf(line, sizeof(line), "{\"type\":\"display_test\",\"oled\":%s,\"draw_errors\":%d}", s_panel ? "true" : "false", s_draw_errors);
+    char line[64];
+    snprintf(line, sizeof(line), "{\"type\":\"display_test\",\"panel\":%s}", s_ready ? "true" : "false");
     serial_emit_raw(line);
+}
+
+// ------------------------------------------------------------------------- setup ---
+static lv_obj_t *make_screen(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, COL_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(scr, false);
+    return scr;
+}
+
+static void build_clock_screen(void)
+{
+    s_clock_screen = make_screen();
+
+    lv_obj_t *ring = lv_obj_create(s_clock_screen);
+    lv_obj_remove_style_all(ring);
+    lv_obj_set_size(ring, 224, 224);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(ring, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(ring, COL_RING, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(ring, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_center(ring);
+
+    s_clock_label = lv_label_create(s_clock_screen);
+    lv_obj_set_style_text_font(s_clock_label, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_clock_label, COL_TEXT, LV_PART_MAIN);
+    lv_label_set_text(s_clock_label, "--:--");
+    lv_obj_center(s_clock_label);
+
+    s_clock_task_dot = lv_obj_create(s_clock_screen);
+    lv_obj_remove_style_all(s_clock_task_dot);
+    lv_obj_set_size(s_clock_task_dot, 14, 14);
+    lv_obj_set_style_radius(s_clock_task_dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_clock_task_dot, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_align(s_clock_task_dot, LV_ALIGN_BOTTOM_MID, 0, -22);
+}
+
+static lv_obj_t *make_ring(lv_obj_t *parent, int size, int width)
+{
+    lv_obj_t *arc = lv_arc_create(parent);
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_set_clickable(arc, false);
+    lv_obj_set_size(arc, size, size);
+    lv_obj_set_style_arc_opa(arc, LV_OPA_TRANSP, LV_PART_MAIN);  // hide the background track
+    lv_obj_set_style_arc_width(arc, width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    lv_obj_center(arc);
+    return arc;
+}
+
+static void build_orb_screen(void)
+{
+    s_orb_screen = make_screen();
+
+    s_orb_glow = lv_obj_create(s_orb_screen);
+    lv_obj_remove_style_all(s_orb_glow);
+    lv_obj_set_size(s_orb_glow, 170, 170);
+    lv_obj_set_style_radius(s_orb_glow, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_orb_glow, 100, LV_PART_MAIN);
+    lv_obj_center(s_orb_glow);
+    breathe_anim(s_orb_glow);
+
+    s_orb_task_ring = make_ring(s_orb_screen, 232, 6);
+    lv_arc_set_angles(s_orb_task_ring, 0, 360);
+    lv_obj_set_style_arc_opa(s_orb_task_ring, LV_OPA_TRANSP, LV_PART_INDICATOR);
+
+    s_orb_ring = make_ring(s_orb_screen, 216, 14);
+    lv_arc_set_angles(s_orb_ring, 0, 108);
+
+    s_orb_label = lv_label_create(s_orb_screen);
+    lv_obj_set_style_text_font(s_orb_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_orb_label, COL_TEXT, LV_PART_MAIN);
+    lv_obj_center(s_orb_label);
+}
+
+static esp_err_t panel_init(esp_lcd_panel_handle_t *panel, esp_lcd_panel_io_handle_t *io)
+{
+    spi_bus_config_t bus = GC9A01_PANEL_BUS_SPI_CONFIG(PIN_TFT_SCLK, PIN_TFT_MOSI, LCD_W * 80 * sizeof(uint16_t));
+    esp_err_t err = spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_lcd_panel_io_spi_config_t io_cfg = GC9A01_PANEL_IO_SPI_CONFIG(PIN_TFT_CS, PIN_TFT_DC, NULL, NULL);
+    io_cfg.pclk_hz = LCD_PCLK_HZ;
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, io);
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_lcd_panel_dev_config_t dev = {
+        .reset_gpio_num = PIN_TFT_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    err = esp_lcd_new_panel_gc9a01(*io, &dev, panel);
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_lcd_panel_reset(*panel);
+    esp_lcd_panel_init(*panel);
+    esp_lcd_panel_disp_on_off(*panel, true);
+    return ESP_OK;
 }
 
 void display_init(void)
 {
-    s_lock = xSemaphoreCreateMutex();
-    i2c_master_bus_handle_t bus;
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
-        ESP_LOGW(TAG, "I2C bus init failed");
+    gpio_config_t bl = {.pin_bit_mask = 1ULL << PIN_TFT_BL, .mode = GPIO_MODE_OUTPUT};
+    gpio_config(&bl);
+    gpio_set_level(PIN_TFT_BL, 0);
+
+    esp_lcd_panel_handle_t panel = NULL;
+    esp_lcd_panel_io_handle_t io = NULL;
+    if (panel_init(&panel, &io) != ESP_OK) {
+        ESP_LOGW(TAG, "no round display found - check wiring on SCLK=%d MOSI=%d CS=%d DC=%d RST=%d",
+                 PIN_TFT_SCLK, PIN_TFT_MOSI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
         return;
     }
-    uint8_t addr = 0;
-    if (i2c_master_probe(bus, 0x3C, 50) == ESP_OK) {
-        addr = 0x3C;
-    } else if (i2c_master_probe(bus, 0x3D, 50) == ESP_OK) {
-        addr = 0x3D;
-    }
-    if (addr == 0) {
-        ESP_LOGW(TAG, "no OLED found at 0x3C/0x3D - check SDA=%d SCL=%d and 3V3", PIN_I2C_SDA, PIN_I2C_SCL);
+
+    const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    if (lvgl_port_init(&port_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "lvgl_port_init failed");
         return;
     }
-    esp_lcd_panel_io_handle_t io;
-    esp_lcd_panel_io_i2c_config_t io_cfg = {
-        .dev_addr = addr,
-        .scl_speed_hz = 400000,
-        .control_phase_bytes = 1,
-        .lcd_cmd_bits = 8,
-        .lcd_param_bits = 8,
-        .dc_bit_offset = 6,
+    const lvgl_port_display_cfg_t disp_cfg = {
+        .io_handle = io,
+        .panel_handle = panel,
+        .buffer_size = LCD_W * 60,
+        .double_buffer = false,
+        .hres = LCD_W,
+        .vres = LCD_H,
+        .color_format = LV_COLOR_FORMAT_RGB565,
+        .flags = {.buff_dma = true, .swap_bytes = true},
     };
-    esp_lcd_panel_ssd1306_config_t ssd = {.height = H};
-    esp_lcd_panel_dev_config_t dev = {
-        .bits_per_pixel = 1,
-        .reset_gpio_num = -1,
-        .vendor_config = &ssd,
-    };
-    if (esp_lcd_new_panel_io_i2c(bus, &io_cfg, &io) != ESP_OK ||
-        esp_lcd_new_panel_ssd1306(io, &dev, &s_panel) != ESP_OK) {
-        s_panel = NULL;
+    s_disp = lvgl_port_add_disp(&disp_cfg);
+    if (s_disp == NULL) {
+        ESP_LOGW(TAG, "lvgl_port_add_disp failed");
         return;
     }
-    esp_lcd_panel_reset(s_panel);
-    esp_lcd_panel_init(s_panel);
-    esp_lcd_panel_disp_on_off(s_panel, true);
-    ESP_LOGI(TAG, "OLED at 0x%02X", addr);
+
+    lvgl_port_lock(0);
+    build_clock_screen();
+    build_orb_screen();
+    lv_disp_load_scr(s_clock_screen);
+    lvgl_port_unlock();
+    lv_timer_create(clock_tick_cb, 500, NULL);
+
+    gpio_set_level(PIN_TFT_BL, 1);
+    s_ready = true;
+    ESP_LOGI(TAG, "round display up on SPI2, backlight GPIO %d", PIN_TFT_BL);
 }

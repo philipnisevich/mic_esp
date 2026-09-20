@@ -15,7 +15,10 @@
 // device as NOVA_DEVICE_USER_ID, so it uses that user's Gmail/Calendar/etc.
 #define NOVA_DEVICE_TOKEN "paste-the-same-token-as-the-backend"
 
-// IANA timezone for "this Thursday at 4". Empty = the server's timezone.
+// IANA timezone for "this Thursday at 4" (also what the round display's
+// clock uses, via a small IANA->POSIX table in net.c - unrecognized zones
+// fall back to UTC; a literal POSIX TZ string like "PST8PDT,M3.2.0,M11.1.0"
+// works too). Empty = the server's timezone, and UTC on the display.
 #define NOVA_TIMEZONE ""
 
 // GPT-Live-1 voice. Empty = the backend's default.

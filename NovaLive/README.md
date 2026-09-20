@@ -66,10 +66,17 @@ every 2.5 s, so a task shorter than that can be missed. At power-on
 the LED does a red-green-blue self-test. `{"cmd":"led_test"}` plays blue, pulsing yellow, green.
 `NOVA_LED_BRIGHTNESS` (config.h) sets the peak level.
 
+If the round TFT (below) is attached, it carries the same idea further: a minimalist clock face at
+rest, and from the wake word through hang-up a rotating gradient ring - styled after the web app's
+`NovaOrb.tsx` - whose speed and colour change with state (connecting, live-idle, recording, thinking,
+speaking). The background-task colours overlay it the same way they overlay the LED. The LED itself is
+unchanged and keeps working whether or not the display is attached.
+
 ## Setup
 
 Same wiring as MicScribe (see `../README.md`): INMP441 on GPIO 4/5/6,
-MAX98357A on 10/11/12, SSD1306 on 8/9 (optional).
+MAX98357A on 10/11/12. Round 1.28" TFT (GC9A01, 240x240, 4-wire SPI, optional)
+on SCLK 13 / MOSI 14 / CS 15 / DC 16 / RST 17 / BL 18.
 
 1. **Backend** (`Nova/backend/.env`): set a device token and choose whose
    connectors the device uses:
@@ -159,7 +166,7 @@ main/session.c     esp_webrtc session, oai-events data channel
 main/signaling.c   SDP exchange through Nova's backend
 main/audio.c       I2S mic/speaker, AEC, capture source + speaker render for WebRTC
 main/wake.c        "hey nova" (MultiNet7)
-main/display.c     SSD1306 state header + live transcript
+main/display.c     round TFT clock + orb (GC9A01 via LVGL/esp_lvgl_port)
 main/net.c         WiFi + NVS settings (same provisioning as MicScribe)
 main/serial.c      JSON-lines protocol (bridge.py / wifi-setup.html compatible)
 main/tasks.c       background-task indicator
