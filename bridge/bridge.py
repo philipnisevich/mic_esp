@@ -143,6 +143,9 @@ def handle_line(line, args):
         if args.verbose:
             detail = event.get("text") or event.get("reason") or ""
             print(f"\033[90m· noise discarded {detail}\033[0m")
+    elif kind == "task_done":
+        # NovaLive: a background task Nova's backend was running finished.
+        print(f"\033[93m✓ finished in the background:\033[0m {event.get('text', '')}")
     elif kind == "error":
         print(f"\033[91m! {event.get('error')}\033[0m", file=sys.stderr)
     elif kind == "state" and args.verbose:
